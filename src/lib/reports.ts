@@ -22,22 +22,88 @@ function money(usd: number) {
   };
 }
 
-/** Top switcher linking ChatGPT ↔ Gemini reports. */
+/** Top switcher linking ChatGPT / Gemini / AI Overview reports. */
 export type PairNav = {
-  gpt: { href: string; current?: boolean };
-  gemini: { href: string; current?: boolean };
+  gpt?: { href: string; current?: boolean };
+  gemini?: { href: string; current?: boolean };
+  aioverview?: { href: string; current?: boolean };
 };
 
 export function buildPairNavHtml(nav: PairNav | null | undefined) {
-  if (!nav?.gpt?.href || !nav?.gemini?.href) return "";
+  if (!nav) return "";
+  const items: { label: string; href: string; on: boolean }[] = [];
+  if (nav.gpt?.href) {
+    items.push({ label: "Relatório ChatGPT", href: nav.gpt.href, on: Boolean(nav.gpt.current) });
+  }
+  if (nav.gemini?.href) {
+    items.push({ label: "Relatório Gemini", href: nav.gemini.href, on: Boolean(nav.gemini.current) });
+  }
+  if (nav.aioverview?.href) {
+    items.push({
+      label: "Relatório AI Overview",
+      href: nav.aioverview.href,
+      on: Boolean(nav.aioverview.current),
+    });
+  }
+  if (items.length < 2) return "";
   const link = (label: string, href: string, on: boolean) =>
     on
       ? `<span class="pair-link on">${label}</span>`
       : `<a class="pair-link" href="${esc(href)}">${label}</a>`;
-  return `<nav class="pair-nav" aria-label="Trocar modelo">
-  ${link("Relatório ChatGPT", nav.gpt.href, Boolean(nav.gpt.current))}
-  ${link("Relatório Gemini", nav.gemini.href, Boolean(nav.gemini.current))}
+  return `<nav class="pair-nav" aria-label="Trocar relatório">
+  ${items.map((i) => link(i.label, i.href, i.on)).join("\n  ")}
 </nav>`;
+}
+
+/** Build pair nav from available sibling reports (client public URLs). */
+export function buildClientPairNav(opts: {
+  current: "gpt" | "gemini" | "aioverview";
+  gpt?: { publicToken: string } | null;
+  gemini?: { publicToken: string } | null;
+  aioverview?: { publicToken: string } | null;
+}): PairNav | null {
+  const nav: PairNav = {};
+  if (opts.gpt?.publicToken) {
+    nav.gpt = { href: `/r/${opts.gpt.publicToken}`, current: opts.current === "gpt" };
+  }
+  if (opts.gemini?.publicToken) {
+    nav.gemini = { href: `/r/${opts.gemini.publicToken}`, current: opts.current === "gemini" };
+  }
+  if (opts.aioverview?.publicToken) {
+    nav.aioverview = {
+      href: `/r/${opts.aioverview.publicToken}`,
+      current: opts.current === "aioverview",
+    };
+  }
+  const n = [nav.gpt, nav.gemini, nav.aioverview].filter(Boolean).length;
+  return n >= 2 ? nav : null;
+}
+
+export function buildInternalPairNav(opts: {
+  current: "gpt" | "gemini" | "aioverview";
+  gpt?: { jobId: string } | null;
+  gemini?: { jobId: string } | null;
+  aioverview?: { publicToken: string } | null;
+}): PairNav | null {
+  const nav: PairNav = {};
+  if (opts.gpt?.jobId) {
+    nav.gpt = { href: `/api/reports/${opts.gpt.jobId}?kind=internal`, current: opts.current === "gpt" };
+  }
+  if (opts.gemini?.jobId) {
+    nav.gemini = {
+      href: `/api/reports/${opts.gemini.jobId}?kind=internal`,
+      current: opts.current === "gemini",
+    };
+  }
+  if (opts.aioverview?.publicToken) {
+    // AI Overview is a single public HTML (no separate internal)
+    nav.aioverview = {
+      href: `/r/${opts.aioverview.publicToken}`,
+      current: opts.current === "aioverview",
+    };
+  }
+  const n = [nav.gpt, nav.gemini, nav.aioverview].filter(Boolean).length;
+  return n >= 2 ? nav : null;
 }
 
 const PAIR_NAV_CSS = `.pair-nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 18px}

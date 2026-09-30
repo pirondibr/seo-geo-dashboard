@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useParams, useRouter } from "next/navigation";
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 
 type Client = { id: string; name: string; siteUrl: string; hosts: string[] };
 
@@ -20,6 +20,15 @@ type LatestJob = {
   phaseReports?: { fase1?: string; fase2?: string; fase3?: string };
   summary?: { hit: number; total: number; pct: number };
   costUsd?: number;
+};
+
+type LatestAi = {
+  id: string;
+  publicToken: string;
+  keywordCount: number;
+  sourceFileName: string;
+  createdAt: string;
+  htmlPath?: string | null;
 };
 
 function formatDateTime(iso?: string | null) {
@@ -40,12 +49,26 @@ function formatDateTime(iso?: string | null) {
 export default function ClientDetailPage() {
   const { id } = useParams<{ id: string }>();
   const router = useRouter();
+  const fileRef = useRef<HTMLInputElement | null>(null);
   const [client, setClient] = useState<Client | null>(null);
   const [latestJobs, setLatestJobs] = useState<LatestJob[]>([]);
   const [latestRunAt, setLatestRunAt] = useState<string | null>(null);
-  const [choice, setChoice] = useState<"gpt" | "gemini" | "both">("both");
+  const [latestAi, setLatestAi] = useState<LatestAi | null>(null);
+  const [choice, setChoice] = useState<"gpt" | "gemini" | "both">("gpt");
   const [error, setError] = useState("");
+  const [aiError, setAiError] = useState("");
   const [loading, setLoading] = useState(false);
+  const [aiLoading, setAiLoading] = useState(false);
+
+  async function loadClient() {
+    const res = await fetch(`/api/clients/${id}`);
+    if (!res.ok) return;
+    const d = await res.json();
+    setClient(d.client || null);
+    setLatestJobs(d.latestJobs || []);
+    setLatestRunAt(d.latestRunAt || null);
+    setLatestAi(d.latestAiOverview || null);
+  }
 
   useEffect(() => {
     let alive = true;
@@ -57,6 +80,7 @@ export default function ClientDetailPage() {
       setClient(d.client || null);
       setLatestJobs(d.latestJobs || []);
       setLatestRunAt(d.latestRunAt || null);
+      setLatestAi(d.latestAiOverview || null);
     }
     load();
     const t = setInterval(load, 5000);
@@ -86,6 +110,28 @@ export default function ClientDetailPage() {
     else router.push("/agency");
   }
 
+  async function uploadAiOverview(e: FormEvent) {
+    e.preventDefault();
+    const file = fileRef.current?.files?.[0];
+    if (!file) {
+      setAiError("Selecione o arquivo Semrush (.xlsx)");
+      return;
+    }
+    setAiLoading(true);
+    setAiError("");
+    const fd = new FormData();
+    fd.append("file", file);
+    const res = await fetch(`/api/clients/${id}/aioverview`, { method: "POST", body: fd });
+    const data = await res.json();
+    setAiLoading(false);
+    if (!res.ok) {
+      setAiError(data.error || "Falha ao importar");
+      return;
+    }
+    if (fileRef.current) fileRef.current.value = "";
+    await loadClient();
+  }
+
   if (!client) return <p className="muted">Carregando…</p>;
 
   return (
@@ -101,8 +147,10 @@ export default function ClientDetailPage() {
       </p>
 
       <form className="card" onSubmit={startJob} style={{ marginTop: 20, maxWidth: 640 }}>
-        <h2 style={{ marginTop: 0 }}>Gerar relatório</h2>
-        <p className="muted">Roda as 3 fases de dados e monta o relatório do cliente automaticamente.</p>
+        <h2 style={{ marginTop: 0 }}>Gerar relatório GEO</h2>
+        <p className="muted">
+          Rode primeiro o ChatGPT e depois o Gemini. As 3 fases de dados montam o relatório do cliente.
+        </p>
         <div className="field">
           <label>Modelo</label>
           <div className="choice">
@@ -132,10 +180,10 @@ export default function ClientDetailPage() {
 
         <hr style={{ border: 0, borderTop: "1px solid #e2dbd0", margin: "22px 0 16px" }} />
 
-        <h3 style={{ margin: "0 0 6px", fontSize: "1.05rem" }}>Última run</h3>
+        <h3 style={{ margin: "0 0 6px", fontSize: "1.05rem" }}>Última run GEO</h3>
         {!latestJobs.length ? (
           <p className="muted" style={{ margin: 0 }}>
-            Ainda sem jobs para este cliente.
+            Ainda sem jobs GEO para este cliente.
           </p>
         ) : (
           <>
@@ -198,12 +246,7 @@ export default function ClientDetailPage() {
                         </span>
                       )}
                       {hasClient ? (
-                        <a
-                          className="btn secondary"
-                          href={`/r/${j.publicToken}`}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
+                        <a className="btn secondary" href={`/r/${j.publicToken}`} target="_blank" rel="noreferrer">
                           Relatório cliente
                         </a>
                       ) : (
@@ -221,6 +264,40 @@ export default function ClientDetailPage() {
             </div>
           </>
         )}
+      </form>
+
+      <form className="card" onSubmit={uploadAiOverview} style={{ marginTop: 16, maxWidth: 640 }}>
+        <h2 style={{ marginTop: 0 }}>Relatório AI Overview</h2>
+        <p className="muted">
+          Importe o export Semrush Organic Positions (.xlsx). O sistema filtra as palavras com{" "}
+          <strong>AI overview</strong> e gera o 3º relatório, com links para ChatGPT e Gemini no topo.
+        </p>
+        <div className="field">
+          <label>Arquivo Semrush</label>
+          <input ref={fileRef} type="file" accept=".xlsx,.xls,.csv" />
+        </div>
+        {aiError ? <p className="error">{aiError}</p> : null}
+        <div className="row-actions">
+          <button className="btn" type="submit" disabled={aiLoading}>
+            {aiLoading ? "Importando…" : "Importar e gerar"}
+          </button>
+        </div>
+
+        {latestAi ? (
+          <>
+            <hr style={{ border: 0, borderTop: "1px solid #e2dbd0", margin: "22px 0 16px" }} />
+            <h3 style={{ margin: "0 0 6px", fontSize: "1.05rem" }}>Último AI Overview</h3>
+            <p className="muted" style={{ margin: "0 0 8px", fontSize: "0.92rem" }}>
+              {formatDateTime(latestAi.createdAt)} · {latestAi.keywordCount.toLocaleString("pt-BR")} palavras ·{" "}
+              {latestAi.sourceFileName}
+            </p>
+            <div className="row-actions">
+              <a className="btn secondary" href={`/r/${latestAi.publicToken}`} target="_blank" rel="noreferrer">
+                Abrir relatório AI Overview
+              </a>
+            </div>
+          </>
+        ) : null}
       </form>
     </main>
   );

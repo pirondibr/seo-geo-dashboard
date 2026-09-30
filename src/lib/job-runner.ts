@@ -18,10 +18,10 @@ import {
   renewJobLock,
   releaseJobLock,
   hasActiveJobLock,
-  listJobs,
   type JobLockHandle,
 } from "./store";
-import { buildClientHtml, buildInternalHtml, type PairNav } from "./reports";
+import { buildClientHtml, buildInternalHtml, buildClientPairNav, buildInternalPairNav } from "./reports";
+import { resolveReportSiblings, syncCrossLinkedReports } from "./cross-link";
 import { brandRoot, hostOf, isSocial, normalizeHost } from "./domain";
 import type { JobLogLevel, JobRecord, ModelKind, ProbeResult } from "./types";
 import { FX_BRL, MODELS } from "./types";
@@ -584,67 +584,39 @@ export async function runTick(jobId: string): Promise<TickResult> {
       job = claimed.job;
       const held = claimed.lock;
 
-      // After Gemini finishes, cross-link with the latest done ChatGPT run for this client
-      let pairGpt: JobRecord | null = null;
+      // After Gemini finishes, cross-link with latest ChatGPT (+ AI Overview if any)
+      let pairNavClient = null as ReturnType<typeof buildClientPairNav>;
+      let pairNavInternal = null as ReturnType<typeof buildInternalPairNav>;
+
       if (job.modelKind === "gemini") {
-        const siblings = (await listJobs())
-          .filter(
-            (j) =>
-              j.clientId === job.clientId &&
-              j.modelKind === "gpt" &&
-              j.status === "done" &&
-              j.publicToken &&
-              j.id !== job.id
-          )
-          .sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
-        if (siblings[0]) {
-          pairGpt = (await getJob(siblings[0].id)) || siblings[0];
+        const { gpt, aio } = await resolveReportSiblings(job.clientId, job);
+        if (gpt) {
+          job.pairedReport = {
+            jobId: gpt.id,
+            modelKind: "gpt",
+            publicToken: gpt.publicToken,
+          };
         }
-      }
-
-      const clientNav = (forKind: "gpt" | "gemini"): PairNav | null => {
-        if (!pairGpt) return null;
-        return {
-          gpt: {
-            href: `/r/${pairGpt.publicToken}`,
-            current: forKind === "gpt",
-          },
-          gemini: {
-            href: `/r/${job.publicToken}`,
-            current: forKind === "gemini",
-          },
-        };
-      };
-      const internalNav = (forKind: "gpt" | "gemini"): PairNav | null => {
-        if (!pairGpt) return null;
-        return {
-          gpt: {
-            href: `/api/reports/${pairGpt.id}?kind=internal`,
-            current: forKind === "gpt",
-          },
-          gemini: {
-            href: `/api/reports/${job.id}?kind=internal`,
-            current: forKind === "gemini",
-          },
-        };
-      };
-
-      if (pairGpt) {
-        job.pairedReport = {
-          jobId: pairGpt.id,
-          modelKind: "gpt",
-          publicToken: pairGpt.publicToken,
-        };
+        pairNavClient = buildClientPairNav({
+          current: "gemini",
+          gpt: gpt ? { publicToken: gpt.publicToken } : null,
+          gemini: { publicToken: job.publicToken },
+          aioverview: aio ? { publicToken: aio.publicToken } : null,
+        });
+        pairNavInternal = buildInternalPairNav({
+          current: "gemini",
+          gpt: gpt ? { jobId: gpt.id } : null,
+          gemini: { jobId: job.id },
+          aioverview: aio ? { publicToken: aio.publicToken } : null,
+        });
       }
 
       const internal = buildInternalHtml(job, {
         through: 3,
         draft: false,
-        pairNav: job.modelKind === "gemini" ? internalNav("gemini") : null,
+        pairNav: pairNavInternal,
       });
-      const client = buildClientHtml(job, {
-        pairNav: job.modelKind === "gemini" ? clientNav("gemini") : null,
-      });
+      const client = buildClientHtml(job, { pairNav: pairNavClient });
       const clientFixed = fixFormatAnswer(client);
       const iSaved = await saveReportHtml(job.id, "internal", internal, { suffix: `final-${Date.now()}` });
       const cSaved = await saveReportHtml(job.id, "client", clientFixed, { suffix: `final-${Date.now()}` });
@@ -667,43 +639,22 @@ export async function runTick(jobId: string): Promise<TickResult> {
         `Concluído · ${job.summary.hit}/${job.summary.total} (${job.summary.pct}%) · custo US$ ${job.costUsd.toFixed(2)} · R$ ${(job.costUsd * FX_BRL).toFixed(2)}`,
         "ok"
       );
+      clearLeaseFields(job);
+      await saveJob(job);
 
-      if (pairGpt) {
+      if (job.modelKind === "gemini") {
         try {
-          pairGpt.pairedReport = {
-            jobId: job.id,
-            modelKind: "gemini",
-            publicToken: job.publicToken,
-          };
-          const gptInternal = buildInternalHtml(pairGpt, {
-            through: 3,
-            draft: false,
-            pairNav: internalNav("gpt"),
-          });
-          const gptClient = fixFormatAnswer(
-            buildClientHtml(pairGpt, { pairNav: clientNav("gpt") })
-          );
-          const gi = await saveReportHtml(pairGpt.id, "internal", gptInternal, {
-            suffix: `paired-${Date.now()}`,
-          });
-          const gc = await saveReportHtml(pairGpt.id, "client", gptClient, {
-            suffix: `paired-${Date.now()}`,
-          });
-          pairGpt.internalHtmlPath = gi.path;
-          pairGpt.clientHtmlPath = gc.path;
-          await saveJob(pairGpt);
-          pushLog(job, `Links cruzados com ChatGPT · job ${pairGpt.id}`, "ok");
+          await syncCrossLinkedReports(job.clientId);
+          pushLog(job, "Links cruzados atualizados (ChatGPT / Gemini / AI Overview)", "ok");
         } catch (e) {
           pushLog(
             job,
-            `Não foi possível atualizar o relatório ChatGPT com o link: ${e instanceof Error ? e.message : String(e)}`,
+            `Falha ao cruzar links: ${e instanceof Error ? e.message : String(e)}`,
             "warn"
           );
         }
       }
 
-      clearLeaseFields(job);
-      await saveJob(job);
       await releaseJobLock(held);
       return { job };
     }

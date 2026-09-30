@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isLoggedIn } from "@/lib/auth";
-import { getJob, getJobByPublicToken, readReportHtml } from "@/lib/store";
+import { getJob, getJobByPublicToken, getAiOverviewByPublicToken, readReportHtml } from "@/lib/store";
 
 export const dynamic = "force-dynamic";
 
@@ -16,7 +16,7 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ token: stri
       const job = await getJob(token);
       if (!job) return NextResponse.json({ error: "Job não encontrado" }, { status: 404 });
 
-      const phase = req.nextUrl.searchParams.get("phase"); // fase1 | fase2 | fase3 | (latest)
+      const phase = req.nextUrl.searchParams.get("phase");
       let path = job.internalHtmlPath;
       if (phase === "fase1" || phase === "fase2" || phase === "fase3") {
         path = job.phaseReports?.[phase] || path;
@@ -29,7 +29,18 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ token: stri
       });
     }
 
-    // public client report by publicToken
+    // AI Overview public report (same /r/{token} entry)
+    const aio = await getAiOverviewByPublicToken(token);
+    if (aio?.htmlPath) {
+      const html = await readReportHtml(aio.htmlPath);
+      if (html) {
+        return new NextResponse(html, {
+          headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "public, max-age=60" },
+        });
+      }
+    }
+
+    // ChatGPT / Gemini client report by publicToken
     const job = await getJobByPublicToken(token);
     if (!job?.clientHtmlPath) {
       if (await isLoggedIn()) {

@@ -3,6 +3,7 @@ import fs from "fs/promises";
 import path from "path";
 import { nanoid } from "nanoid";
 import type { ClientRecord, JobRecord } from "./types";
+import type { AiOverviewRecord } from "./aioverview";
 
 const LOCAL_ROOT = path.join(process.cwd(), ".data");
 
@@ -259,7 +260,12 @@ export async function saveJob(job: JobRecord) {
       try {
         await put(
           `public-tokens/${job.publicToken}.json`,
-          JSON.stringify({ jobId: job.id, status: job.status, clientHtmlPath: job.clientHtmlPath || null }),
+          JSON.stringify({
+            kind: "job",
+            jobId: job.id,
+            status: job.status,
+            clientHtmlPath: job.clientHtmlPath || null,
+          }),
           {
             access: "public",
             addRandomSuffix: false,
@@ -497,4 +503,154 @@ export async function saveReportHtml(
 export async function readReportHtml(rel: string) {
   if (useBlob()) return readBlobText(rel);
   return readTextLocal(rel);
+}
+
+// ——— AI Overview reports (Semrush import) ———
+
+async function readAiLatest(id: string): Promise<AiOverviewRecord | null> {
+  if (!useBlob()) return readJsonLocal<AiOverviewRecord>(`aioverview/${id}.json`);
+  const listed = await list({ prefix: `aioverview/${id}/v/`, limit: 50 });
+  const versions = listed.blobs
+    .filter((b) => b.pathname.endsWith(".json"))
+    .sort((a, b) => (b.pathname || "").localeCompare(a.pathname || ""));
+  for (const ver of versions.slice(0, 5)) {
+    try {
+      const r = await fetch(ver.url + "?t=" + Date.now(), { cache: "no-store" });
+      if (!r.ok) continue;
+      const rec = (await r.json()) as AiOverviewRecord;
+      if (rec?.id) return rec;
+    } catch {
+      /* try older */
+    }
+  }
+  return readBlobJson<AiOverviewRecord>(`aioverview/${id}.json`);
+}
+
+export async function getAiOverview(id: string) {
+  return readAiLatest(id);
+}
+
+export async function saveAiOverview(rec: AiOverviewRecord) {
+  rec.updatedAt = new Date().toISOString();
+  if (!rec.createdAt) rec.createdAt = rec.updatedAt;
+  if (useBlob()) {
+    const vid = `${Date.now()}-${nanoid(8)}`;
+    const payload = JSON.stringify(rec);
+    await put(`aioverview/${rec.id}/v/${vid}.json`, payload, {
+      access: "public",
+      addRandomSuffix: false,
+      contentType: "application/json",
+      cacheControlMaxAge: 0,
+    });
+    await put(`aioverview/${rec.id}.json`, payload, {
+      access: "public",
+      addRandomSuffix: false,
+      allowOverwrite: true,
+      contentType: "application/json",
+      cacheControlMaxAge: 0,
+    }).catch(() => {});
+    if (rec.publicToken) {
+      await put(
+        `public-tokens/${rec.publicToken}.json`,
+        JSON.stringify({
+          kind: "aioverview",
+          aioId: rec.id,
+          status: "done",
+          clientHtmlPath: rec.htmlPath || null,
+        }),
+        {
+          access: "public",
+          addRandomSuffix: false,
+          allowOverwrite: true,
+          contentType: "application/json",
+          cacheControlMaxAge: 0,
+        }
+      ).catch(() => {});
+    }
+  } else {
+    await writeJsonLocal(`aioverview/${rec.id}.json`, rec);
+    if (rec.publicToken) {
+      await writeJsonLocal(`public-tokens/${rec.publicToken}.json`, {
+        kind: "aioverview",
+        aioId: rec.id,
+        status: "done",
+        clientHtmlPath: rec.htmlPath || null,
+      });
+    }
+  }
+}
+
+export async function listAiOverviewForClient(clientId: string): Promise<AiOverviewRecord[]> {
+  if (useBlob()) {
+    const listed = await list({ prefix: "aioverview/", limit: 500 });
+    const ids = new Set<string>();
+    for (const b of listed.blobs) {
+      const top = /^aioverview\/([^/]+)\.json$/.exec(b.pathname);
+      if (top) ids.add(top[1]);
+      const nested = /^aioverview\/([^/]+)\/v\//.exec(b.pathname);
+      if (nested) ids.add(nested[1]);
+    }
+    const out: AiOverviewRecord[] = [];
+    for (const id of ids) {
+      const rec = await readAiLatest(id);
+      if (rec?.clientId === clientId) out.push(rec);
+    }
+    return out.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+  }
+  await ensureLocal();
+  const dir = path.join(LOCAL_ROOT, "aioverview");
+  const files = await fs.readdir(dir).catch(() => [] as string[]);
+  const out: AiOverviewRecord[] = [];
+  for (const f of files) {
+    if (!f.endsWith(".json")) continue;
+    const rec = await readJsonLocal<AiOverviewRecord>(`aioverview/${f}`);
+    if (rec?.clientId === clientId) out.push(rec);
+  }
+  return out.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
+}
+
+export async function getLatestAiOverviewForClient(clientId: string) {
+  const list = await listAiOverviewForClient(clientId);
+  return list[0] || null;
+}
+
+export async function getAiOverviewByPublicToken(token: string) {
+  if (useBlob()) {
+    try {
+      const listed = await list({ prefix: `public-tokens/${token}.json`, limit: 5 });
+      const hit = listed.blobs.find((b) => b.pathname === `public-tokens/${token}.json`);
+      if (hit) {
+        const idx = (await (await fetch(hit.url + "?t=" + Date.now(), { cache: "no-store" })).json()) as {
+          kind?: string;
+          aioId?: string;
+        };
+        if (idx?.kind === "aioverview" && idx.aioId) {
+          const rec = await getAiOverview(idx.aioId);
+          if (rec?.publicToken === token) return rec;
+        }
+      }
+    } catch {
+      /* fall through */
+    }
+  } else {
+    const idx = await readJsonLocal<{ kind?: string; aioId?: string }>(`public-tokens/${token}.json`);
+    if (idx?.kind === "aioverview" && idx.aioId) {
+      const rec = await getAiOverview(idx.aioId);
+      if (rec?.publicToken === token) return rec;
+    }
+  }
+  // light fallback: scan aioverview ids
+  if (useBlob()) {
+    const listed = await list({ prefix: "aioverview/", limit: 300 });
+    const ids = new Set<string>();
+    for (const b of listed.blobs) {
+      const m = b.pathname.match(/^aioverview\/([^/]+)\.json$/);
+      if (m) ids.add(m[1]);
+    }
+    for (const id of ids) {
+      const rec = await readAiLatest(id);
+      if (rec?.publicToken === token) return rec;
+    }
+  }
+  return null;
 }

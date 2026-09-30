@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isLoggedIn } from "@/lib/auth";
-import { deleteClient, getClient, saveClient, listJobs } from "@/lib/store";
+import { deleteClient, getClient, saveClient, listJobs, getLatestAiOverviewForClient } from "@/lib/store";
 import { normalizeHost } from "@/lib/domain";
 
 function slimJob(j: Awaited<ReturnType<typeof listJobs>>[number]) {
@@ -48,10 +48,22 @@ export async function GET(_: NextRequest, ctx: { params: Promise<{ id: string }>
     latestJobs = [...byKind.values()].map(slimJob);
   }
 
+  const latestAi = await getLatestAiOverviewForClient(id);
+
   return NextResponse.json({
     client,
     latestRunAt,
     latestJobs,
+    latestAiOverview: latestAi
+      ? {
+          id: latestAi.id,
+          publicToken: latestAi.publicToken,
+          keywordCount: latestAi.keywordCount,
+          sourceFileName: latestAi.sourceFileName,
+          createdAt: latestAi.createdAt,
+          htmlPath: latestAi.htmlPath || null,
+        }
+      : null,
   });
 }
 
