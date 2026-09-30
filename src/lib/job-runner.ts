@@ -10,7 +10,16 @@ import {
 } from "./prompts";
 import { probePrompt } from "./probe";
 import { mapPool } from "./openrouter";
-import { getJob, saveJob, saveReportHtml } from "./store";
+import {
+  getJob,
+  saveJob,
+  saveReportHtml,
+  tryAcquireJobLock,
+  renewJobLock,
+  releaseJobLock,
+  hasActiveJobLock,
+  type JobLockHandle,
+} from "./store";
 import { buildClientHtml, buildInternalHtml } from "./reports";
 import { brandRoot, hostOf, isSocial, normalizeHost } from "./domain";
 import type { JobLogLevel, JobRecord, ModelKind, ProbeResult } from "./types";
@@ -19,9 +28,9 @@ import { FX_BRL, MODELS } from "./types";
 const BATCH = 4;
 const CONCURRENCY = 4;
 const MAX_LOGS = 200;
-/** One probe batch must finish under Vercel 60s — keep lease longer than that */
 const LOCK_MS = 75_000;
-const LOCK_VERIFY_MS = 180;
+const CLAIM_VERIFY_ATTEMPTS = 8;
+const CLAIM_VERIFY_BASE_MS = 100;
 
 export type TickResult = {
   job: JobRecord;
@@ -32,91 +41,52 @@ function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }
 
-function unlock(job: JobRecord) {
+function clearLeaseFields(job: JobRecord) {
   job.lockedUntil = undefined;
   job.lockOwner = undefined;
   job.claim = undefined;
 }
 
-function renewLock(job: JobRecord, owner: string) {
-  job.lockOwner = owner;
-  job.lockedUntil = new Date(Date.now() + LOCK_MS).toISOString();
+function stampLease(job: JobRecord, lock: JobLockHandle) {
+  job.lockOwner = lock.owner;
+  job.lockedUntil = new Date(lock.until).toISOString();
 }
 
-/** Optimistic lease: write owner, pause, re-read — only proceed if still ours. */
-async function acquireLock(jobId: string): Promise<TickResult | null> {
-  const current = await getJob(jobId);
-  if (!current) throw new Error("Job não encontrado");
-  if (current.status === "done" || current.status === "error") {
-    return { job: current };
-  }
-
-  const locked =
-    current.lockOwner &&
-    current.lockedUntil &&
-    new Date(current.lockedUntil).getTime() > Date.now();
-  if (locked) {
-    return { job: current, busy: true };
-  }
-
-  // Stale lease / orphan claim from a crashed worker — clear and take over
-  const owner = nanoid(12);
-  current.lockOwner = owner;
-  current.lockedUntil = new Date(Date.now() + LOCK_MS).toISOString();
-  current.claim = undefined;
-  current.status = "running";
-  await saveJob(current);
-  await sleep(LOCK_VERIFY_MS);
-
-  const verified = await getJob(jobId);
-  if (!verified) throw new Error("Job não encontrado");
-  if (verified.lockOwner !== owner) {
-    return { job: verified, busy: true };
-  }
-  if (verified.status === "done" || verified.status === "error") {
-    return { job: verified };
-  }
-  return { job: verified };
+async function continueJob(job: JobRecord, jobId: string, lock: JobLockHandle) {
+  job.claim = undefined;
+  stampLease(job, { ...lock, until: Date.now() + 4_000 });
+  await saveJob(job);
+  await releaseJobLock(lock);
+  await scheduleTick(jobId);
 }
 
-async function stillOwns(jobId: string, owner: string): Promise<JobRecord | null> {
-  const fresh = await getJob(jobId);
-  if (!fresh) return null;
-  if (fresh.lockOwner !== owner) return null;
-  if (!fresh.lockedUntil || new Date(fresh.lockedUntil).getTime() <= Date.now()) return null;
-  return fresh;
-}
-
-/**
- * Reserve paid work BEFORE calling OpenRouter.
- * Returns null if another worker already claimed / advanced.
- */
 async function claimWork(
   job: JobRecord,
-  owner: string,
+  lock: JobLockHandle,
   phase: string,
   from: number,
   to: number
-): Promise<JobRecord | null> {
-  renewLock(job, owner);
-  job.claim = { owner, phase, from, to, at: new Date().toISOString() };
+): Promise<{ job: JobRecord; lock: JobLockHandle } | null> {
+  const renewed = (await renewJobLock(lock, LOCK_MS)) || lock;
+  stampLease(job, renewed);
+  job.claim = { owner: renewed.owner, phase, from, to, at: new Date().toISOString() };
   await saveJob(job);
-  await sleep(LOCK_VERIFY_MS);
 
-  const fresh = await stillOwns(job.id, owner);
-  if (!fresh) return null;
-  if (!fresh.claim || fresh.claim.owner !== owner || fresh.claim.phase !== phase) return null;
-  if (fresh.claim.from !== from || fresh.claim.to !== to) return null;
-  return fresh;
-}
-
-async function continueJob(job: JobRecord, jobId: string, owner: string) {
-  // Keep lease briefly so overlapping resume/tick sees busy; next tick re-acquires
-  job.lockOwner = owner;
-  job.lockedUntil = new Date(Date.now() + 3_000).toISOString();
-  job.claim = undefined;
-  await saveJob(job);
-  await scheduleTick(jobId);
+  for (let i = 0; i < CLAIM_VERIFY_ATTEMPTS; i++) {
+    await sleep(CLAIM_VERIFY_BASE_MS + i * 70);
+    const fresh = await getJob(job.id);
+    if (!fresh) continue;
+    if (
+      fresh.claim?.owner === renewed.owner &&
+      fresh.claim.phase === phase &&
+      fresh.claim.from === from &&
+      fresh.claim.to === to
+    ) {
+      return { job: fresh, lock: renewed };
+    }
+    if (fresh.claim && fresh.claim.owner !== renewed.owner) return null;
+  }
+  return null;
 }
 
 export function pushLog(job: JobRecord, message: string, level: JobLogLevel = "info") {
@@ -183,7 +153,7 @@ export async function scheduleTick(jobId: string) {
         const job = await getJob(jobId);
         if (job && job.status !== "done" && job.status !== "error") {
           pushLog(job, `Worker falhou: ${e instanceof Error ? e.message : String(e)}`, "error");
-          unlock(job);
+          clearLeaseFields(job);
           await saveJob(job);
         }
       } catch {
@@ -205,11 +175,9 @@ export async function scheduleTick(jobId: string) {
     },
   })
     .then(async (res) => {
-      // 409 = another worker holds the lease — do NOT start a second inline worker
       if (res.status === 409) return;
       if (!res.ok) {
         console.error("scheduleTick HTTP", res.status, await res.text().catch(() => ""));
-        // Only inline-fallback on hard failures, and acquireLock will no-op if busy
         await runInline();
       }
     })
@@ -226,13 +194,29 @@ export async function scheduleTick(jobId: string) {
 }
 
 export async function runTick(jobId: string): Promise<TickResult> {
-  const acquired = await acquireLock(jobId);
-  if (!acquired) throw new Error("Job não encontrado");
-  if (acquired.busy) return acquired;
-  if (acquired.job.status === "done" || acquired.job.status === "error") return acquired;
+  const current = await getJob(jobId);
+  if (!current) throw new Error("Job não encontrado");
+  if (current.status === "done" || current.status === "error") return { job: current };
 
-  const owner = acquired.job.lockOwner!;
-  let job = acquired.job;
+  if (await hasActiveJobLock(jobId)) {
+    return { job: current, busy: true };
+  }
+
+  let lock = await tryAcquireJobLock(jobId, LOCK_MS);
+  if (!lock) {
+    const busyJob = (await getJob(jobId)) || current;
+    return { job: busyJob, busy: true };
+  }
+
+  let job = (await getJob(jobId)) || current;
+  if (job.status === "done" || job.status === "error") {
+    await releaseJobLock(lock);
+    return { job };
+  }
+
+  job.status = "running";
+  stampLease(job, lock);
+  await saveJob(job);
 
   try {
     if (!job.startedAt) {
@@ -245,7 +229,6 @@ export async function runTick(jobId: string): Promise<TickResult> {
       job.phase = "crawl";
       job.label = "Lendo homepage…";
       pushLog(job, `Abrindo ${job.siteUrl}…`);
-      renewLock(job, owner);
       await saveJob(job);
     }
 
@@ -253,12 +236,9 @@ export async function runTick(jobId: string): Promise<TickResult> {
       if (!job.siteBrief) {
         job.label = "Lendo homepage…";
         pushLog(job, `Abrindo ${job.siteUrl}…`);
-        renewLock(job, owner);
         await saveJob(job);
         const site = await crawlHomepage(job.siteUrl);
-        const owned = await stillOwns(jobId, owner);
-        if (!owned) return { job, busy: true };
-        job = owned;
+        job = (await getJob(jobId)) || job;
         if (!job.hosts.length) job.hosts = [site.host];
         else if (!job.hosts.includes(site.host)) job.hosts = [site.host, ...job.hosts];
         job.siteBrief = `${site.title}\n\n${site.text}`;
@@ -274,25 +254,27 @@ export async function runTick(jobId: string): Promise<TickResult> {
       job.phase = "generate_fase1";
       job.label = "Gerando prompts da fase 1…";
       pushLog(job, "Gerando prompts da fase 1 em 3 lotes (evita timeout)…");
-      await continueJob(job, jobId, owner);
+      await continueJob(job, jobId, lock);
       return { job };
     }
 
     if (job.phase === "generate_fase1") {
       const step = job.fase1GenStep || 0;
       if (step < 3) {
-        const claimed = await claimWork(job, owner, "generate_fase1", step, step + 1);
-        if (!claimed) return { job, busy: true };
-        job = claimed;
+        const claimed = await claimWork(job, lock, "generate_fase1", step, step + 1);
+        if (!claimed) {
+          await releaseJobLock(lock);
+          return { job, busy: true };
+        }
+        job = claimed.job;
+        const held = claimed.lock;
 
-        // Another path may have finished this step while we waited
         if ((job.fase1GenStep || 0) > step) {
-          await continueJob(job, jobId, owner);
+          await continueJob(job, jobId, held);
           return { job };
         }
 
         pushLog(job, `Gerando lote ${step + 1}/3 da fase 1…`);
-        renewLock(job, owner);
         await saveJob(job);
 
         const part = await generateFase1Chunk({
@@ -306,13 +288,12 @@ export async function runTick(jobId: string): Promise<TickResult> {
           startId: (job.promptsFase1?.length || 0) + 1,
         });
 
-        const owned = await stillOwns(jobId, owner);
-        if (!owned || owned.claim?.owner !== owner || owned.claim.from !== step) {
-          pushLog(job, `Lote fase 1 ${step + 1} descartado · lease perdida (evita duplicar prompts)`, "warn");
-          return { job: owned || job, busy: true };
+        job = (await getJob(jobId)) || job;
+        if (job.claim?.owner !== held.owner || job.claim.from !== step) {
+          pushLog(job, `Lote fase 1 ${step + 1} descartado · claim perdida`, "warn");
+          await releaseJobLock(held);
+          return { job, busy: true };
         }
-        job = owned;
-        // Only append if step still matches (idempotent)
         if ((job.fase1GenStep || 0) === step) {
           job.promptsFase1 = [...(job.promptsFase1 || []), ...part.prompts];
           job.costUsd += part.cost;
@@ -326,9 +307,11 @@ export async function runTick(jobId: string): Promise<TickResult> {
 
         if ((job.fase1GenStep || 0) < 3) {
           job.label = `Gerando prompts da fase 1… (${job.fase1GenStep}/3)`;
-          await continueJob(job, jobId, owner);
+          await continueJob(job, jobId, held);
           return { job };
         }
+        // fall through with held lock
+        lock = held;
       }
 
       const prompts = job.promptsFase1 || [];
@@ -344,16 +327,20 @@ export async function runTick(jobId: string): Promise<TickResult> {
       job.resultsFase1 = [];
       pushLog(job, `Fase 1 pronta: ${job.promptsFase1.length} prompts`, "ok");
       pushLog(job, `Iniciando sondagens OpenRouter (lotes de ${BATCH}, concorrência ${CONCURRENCY})…`);
-      await continueJob(job, jobId, owner);
+      await continueJob(job, jobId, lock);
       return { job };
     }
 
     if (job.phase === "fase1") {
-      const progressed = await runProbeBatch(job, "fase1", owner);
-      if (!progressed) return { job, busy: true };
-      job = progressed;
+      const progressed = await runProbeBatch(job, "fase1", lock);
+      if (!progressed) {
+        await releaseJobLock(lock);
+        return { job, busy: true };
+      }
+      job = progressed.job;
+      const held = progressed.lock;
       if ((job.cursor || 0) < (job.promptsFase1 || []).length) {
-        await continueJob(job, jobId, owner);
+        await continueJob(job, jobId, held);
         return { job };
       }
       const hits = (job.resultsFase1 || []).filter((r) => r.site).length;
@@ -361,14 +348,14 @@ export async function runTick(jobId: string): Promise<TickResult> {
       job.phase = "generate_fase2";
       job.label = "Montando fase 2…";
       pushLog(job, "Escolhendo seeds e gerando variações da fase 2…");
-      await continueJob(job, jobId, owner);
+      await continueJob(job, jobId, held);
       return { job };
     }
 
     if (job.phase === "generate_fase2") {
       if (job.promptsFase2 && job.promptsFase2.length > 0) {
         job.phase = "fase2";
-        await continueJob(job, jobId, owner);
+        await continueJob(job, jobId, lock);
         return { job };
       }
       const hits = (job.resultsFase1 || []).filter((r) => r.site);
@@ -379,27 +366,31 @@ export async function runTick(jobId: string): Promise<TickResult> {
         pushLog(job, "Nenhum seed na fase 1 · pulando fase 2", "warn");
         job.phase = "generate_fase3";
         job.label = "Sem seeds na fase 2 · indo para fase 3…";
-        await continueJob(job, jobId, owner);
+        await continueJob(job, jobId, lock);
         return { job };
       }
 
-      const claimed = await claimWork(job, owner, "generate_fase2", 0, 1);
-      if (!claimed) return { job, busy: true };
-      job = claimed;
+      const claimed = await claimWork(job, lock, "generate_fase2", 0, 1);
+      if (!claimed) {
+        await releaseJobLock(lock);
+        return { job, busy: true };
+      }
+      job = claimed.job;
+      const held = claimed.lock;
       if (job.promptsFase2 && job.promptsFase2.length > 0) {
         job.phase = "fase2";
-        await continueJob(job, jobId, owner);
+        await continueJob(job, jobId, held);
         return { job };
       }
 
       pushLog(job, `Seeds fase 2: ${seeds.map((s) => s.padrao).join(", ")}`);
       const gen = await generateFase2Prompts({ modelId: job.modelId, seeds });
-      const owned = await stillOwns(jobId, owner);
-      if (!owned || owned.claim?.owner !== owner) {
-        pushLog(job, "Geração fase 2 descartada · lease perdida", "warn");
-        return { job: owned || job, busy: true };
+      job = (await getJob(jobId)) || job;
+      if (job.claim?.owner !== held.owner) {
+        pushLog(job, "Geração fase 2 descartada · claim perdida", "warn");
+        await releaseJobLock(held);
+        return { job, busy: true };
       }
-      job = owned;
       if (!job.promptsFase2?.length) {
         job.promptsFase2 = gen.prompts;
         job.costUsd += gen.cost;
@@ -411,16 +402,20 @@ export async function runTick(jobId: string): Promise<TickResult> {
       job.total = job.promptsFase2.length;
       job.label = `Fase 2 · 0/${job.promptsFase2.length}`;
       job.resultsFase2 = job.resultsFase2 || [];
-      await continueJob(job, jobId, owner);
+      await continueJob(job, jobId, held);
       return { job };
     }
 
     if (job.phase === "fase2") {
-      const progressed = await runProbeBatch(job, "fase2", owner);
-      if (!progressed) return { job, busy: true };
-      job = progressed;
+      const progressed = await runProbeBatch(job, "fase2", lock);
+      if (!progressed) {
+        await releaseJobLock(lock);
+        return { job, busy: true };
+      }
+      job = progressed.job;
+      const held = progressed.lock;
       if ((job.cursor || 0) < (job.promptsFase2 || []).length) {
-        await continueJob(job, jobId, owner);
+        await continueJob(job, jobId, held);
         return { job };
       }
       const hits = (job.resultsFase2 || []).filter((r) => r.site).length;
@@ -428,14 +423,14 @@ export async function runTick(jobId: string): Promise<TickResult> {
       job.phase = "generate_fase3";
       job.label = "Montando fase 3…";
       pushLog(job, "Gerando situações da fase 3…");
-      await continueJob(job, jobId, owner);
+      await continueJob(job, jobId, held);
       return { job };
     }
 
     if (job.phase === "generate_fase3") {
       if (job.promptsFase3 && job.promptsFase3.length > 0) {
         job.phase = "fase3";
-        await continueJob(job, jobId, owner);
+        await continueJob(job, jobId, lock);
         return { job };
       }
       const hits = (job.resultsFase1 || []).filter((r) => r.site);
@@ -452,17 +447,21 @@ export async function runTick(jobId: string): Promise<TickResult> {
         pushLog(job, "Sem recursos para fase 3 · indo aos relatórios", "warn");
         job.phase = "build_reports";
         job.label = "Gerando relatórios…";
-        await continueJob(job, jobId, owner);
+        await continueJob(job, jobId, lock);
         return { job };
       }
       recursos = recursos.slice(0, 4);
 
-      const claimed = await claimWork(job, owner, "generate_fase3", 0, 1);
-      if (!claimed) return { job, busy: true };
-      job = claimed;
+      const claimed = await claimWork(job, lock, "generate_fase3", 0, 1);
+      if (!claimed) {
+        await releaseJobLock(lock);
+        return { job, busy: true };
+      }
+      job = claimed.job;
+      const held = claimed.lock;
       if (job.promptsFase3 && job.promptsFase3.length > 0) {
         job.phase = "fase3";
-        await continueJob(job, jobId, owner);
+        await continueJob(job, jobId, held);
         return { job };
       }
 
@@ -476,12 +475,12 @@ export async function runTick(jobId: string): Promise<TickResult> {
         recursos,
         avoidTexts: avoid,
       });
-      const owned = await stillOwns(jobId, owner);
-      if (!owned || owned.claim?.owner !== owner) {
-        pushLog(job, "Geração fase 3 descartada · lease perdida", "warn");
-        return { job: owned || job, busy: true };
+      job = (await getJob(jobId)) || job;
+      if (job.claim?.owner !== held.owner) {
+        pushLog(job, "Geração fase 3 descartada · claim perdida", "warn");
+        await releaseJobLock(held);
+        return { job, busy: true };
       }
-      job = owned;
       if (!job.promptsFase3?.length) {
         job.promptsFase3 = gen.prompts;
         job.costUsd += gen.cost;
@@ -493,16 +492,20 @@ export async function runTick(jobId: string): Promise<TickResult> {
       job.total = job.promptsFase3.length;
       job.label = `Fase 3 · 0/${job.promptsFase3.length}`;
       job.resultsFase3 = job.resultsFase3 || [];
-      await continueJob(job, jobId, owner);
+      await continueJob(job, jobId, held);
       return { job };
     }
 
     if (job.phase === "fase3") {
-      const progressed = await runProbeBatch(job, "fase3", owner);
-      if (!progressed) return { job, busy: true };
-      job = progressed;
+      const progressed = await runProbeBatch(job, "fase3", lock);
+      if (!progressed) {
+        await releaseJobLock(lock);
+        return { job, busy: true };
+      }
+      job = progressed.job;
+      const held = progressed.lock;
       if ((job.cursor || 0) < (job.promptsFase3 || []).length) {
-        await continueJob(job, jobId, owner);
+        await continueJob(job, jobId, held);
         return { job };
       }
       const hits = (job.resultsFase3 || []).filter((r) => r.site).length;
@@ -510,14 +513,18 @@ export async function runTick(jobId: string): Promise<TickResult> {
       job.phase = "build_reports";
       job.label = "Gerando relatórios…";
       pushLog(job, "Montando HTML interno e relatório do cliente…");
-      await continueJob(job, jobId, owner);
+      await continueJob(job, jobId, held);
       return { job };
     }
 
     if (job.phase === "build_reports") {
-      const claimed = await claimWork(job, owner, "build_reports", 0, 1);
-      if (!claimed) return { job, busy: true };
-      job = claimed;
+      const claimed = await claimWork(job, lock, "build_reports", 0, 1);
+      if (!claimed) {
+        await releaseJobLock(lock);
+        return { job, busy: true };
+      }
+      job = claimed.job;
+      const held = claimed.lock;
 
       const internal = buildInternalHtml(job);
       const client = buildClientHtml(job);
@@ -537,37 +544,36 @@ export async function runTick(jobId: string): Promise<TickResult> {
         `Concluído · ${job.summary.hit}/${job.summary.total} (${job.summary.pct}%) · custo US$ ${job.costUsd.toFixed(2)} · R$ ${(job.costUsd * FX_BRL).toFixed(2)}`,
         "ok"
       );
-      unlock(job);
+      clearLeaseFields(job);
       await saveJob(job);
+      await releaseJobLock(held);
       return { job };
     }
 
     pushLog(job, `Fase desconhecida: ${job.phase}`, "warn");
-    unlock(job);
+    clearLeaseFields(job);
     await saveJob(job);
+    await releaseJobLock(lock);
     return { job };
   } catch (e) {
     const latest = (await getJob(jobId)) || job;
-    // Only the owner may mark error (avoid clobbering a healthy worker)
-    if (latest.lockOwner === owner || !latest.lockOwner) {
-      latest.status = "error";
-      latest.phase = "error";
-      latest.error = e instanceof Error ? e.message : String(e);
-      latest.label = "Erro";
-      unlock(latest);
-      pushLog(latest, `Erro: ${latest.error}`, "error");
-      await saveJob(latest);
-      return { job: latest };
-    }
-    return { job: latest, busy: true };
+    latest.status = "error";
+    latest.phase = "error";
+    latest.error = e instanceof Error ? e.message : String(e);
+    latest.label = "Erro";
+    clearLeaseFields(latest);
+    pushLog(latest, `Erro: ${latest.error}`, "error");
+    await saveJob(latest);
+    await releaseJobLock(lock);
+    return { job: latest };
   }
 }
 
 async function runProbeBatch(
   job: JobRecord,
   phase: "fase1" | "fase2" | "fase3",
-  owner: string
-): Promise<JobRecord | null> {
+  lock: JobLockHandle
+): Promise<{ job: JobRecord; lock: JobLockHandle } | null> {
   const prompts =
     phase === "fase1"
       ? job.promptsFase1 || []
@@ -583,43 +589,44 @@ async function runProbeBatch(
     job.cursor = existing;
     job.done = existing;
     job.total = prompts.length;
-    return job;
+    return { job, lock };
   }
 
   const from = existing;
   const to = existing + slice.length;
-  const claimed = await claimWork(job, owner, phase, from, to);
+  const claimed = await claimWork(job, lock, phase, from, to);
   if (!claimed) return null;
-  job = claimed;
+  job = claimed.job;
+  lock = claimed.lock;
 
-  // Re-check length after claim — another worker may have appended
   const afterClaimLen = ((job[resultsKey] as ProbeResult[]) || []).length;
   if (afterClaimLen !== from) {
     job.cursor = afterClaimLen;
     job.done = afterClaimLen;
     job.total = prompts.length;
-    return job;
+    return { job, lock };
   }
 
   const labelPhase = phase === "fase1" ? "Fase 1" : phase === "fase2" ? "Fase 2" : "Fase 3";
   pushLog(job, `${labelPhase} · sondando ${from + 1}–${to} de ${prompts.length}…`);
-  renewLock(job, owner);
+  const renewed = (await renewJobLock(lock, LOCK_MS)) || lock;
+  lock = renewed;
+  stampLease(job, lock);
   await saveJob(job);
 
   const batchResults = await mapPool(slice, CONCURRENCY, (p) =>
     probePrompt({ prompt: p, modelId: job.modelId, hosts: job.hosts })
   );
 
-  const owned = await stillOwns(job.id, owner);
-  if (!owned || owned.claim?.owner !== owner || owned.claim.from !== from) {
+  job = (await getJob(job.id)) || job;
+  if (job.claim?.owner !== lock.owner || job.claim.from !== from) {
     pushLog(
       job,
-      `${labelPhase} · lote ${from + 1}–${to} NÃO salvo · outro worker tomou o lease (crédito pode ter sido gasto; não duplicamos resultado)`,
+      `${labelPhase} · lote ${from + 1}–${to} NÃO salvo · claim perdida (não duplicamos resultado)`,
       "warn"
     );
-    return owned;
+    return { job, lock };
   }
-  job = owned;
 
   const freshResults = ((job[resultsKey] as ProbeResult[]) || []) as ProbeResult[];
   if (freshResults.length !== from) {
@@ -631,7 +638,7 @@ async function runProbeBatch(
     job.cursor = freshResults.length;
     job.done = freshResults.length;
     job.total = prompts.length;
-    return job;
+    return { job, lock };
   }
 
   job[resultsKey] = [...freshResults, ...batchResults] as any;
@@ -650,7 +657,7 @@ async function runProbeBatch(
     `${labelPhase} · lote ${from + 1}–${to}: ${hits} achou · ${fails ? fails + " erro · " : ""}US$ ${batchCost.toFixed(4)} · total ${job.done}/${job.total}`,
     hits ? "ok" : "info"
   );
-  return job;
+  return { job, lock };
 }
 
 function summarize(job: JobRecord) {
