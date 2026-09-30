@@ -26,7 +26,10 @@ const FASE1_CHUNKS: GenChunk[] = [
 - categoria: 10
 - funcionalidade: 15
 - preço: 5
-Total: 30 prompts.`,
+Total: 30 prompts.
+
+PROIBIDO: citar o nome da marca do cliente, o domínio, ou qualquer variação (ex.: APet, Apet, apetsaude).
+Escreva como quem ainda NÃO escolheu marca: "qual plano pet…", "me indica um plano…", "qual cobertura…".`,
   },
   {
     name: "home B",
@@ -37,17 +40,80 @@ Total: 30 prompts.`,
 - marca: 5
 - problema: 10
 Total: 20 prompts.
-Nos 5 de marca pode citar o nome do cliente. Nos outros NÃO cite a marca nem o domínio.`,
+
+Só no grupo "marca" pode aparecer o nome do cliente.
+Em comparação e problema: PROIBIDO citar a marca ou o domínio. Em comparação use concorrentes genéricos do mercado, não o cliente.`,
   },
   {
     name: "blog",
     minCount: 15,
     maxCount: 20,
     instruction: `Gere 20 prompts do grupo "blog" (2 por assunto quando possível).
-Perguntas comerciais sobre o assunto do post, não "como funciona".
-NÃO cite a marca do cliente nem o domínio.`,
+Perguntas comerciais sobre o assunto (qual plano, me indica, quanto custa), não "como funciona".
+PROIBIDO: citar o nome da marca do cliente ou o domínio.`,
   },
 ];
+
+function brandTokens(clientName: string, host: string) {
+  const tokens = new Set<string>();
+  const push = (s: string) => {
+    const t = s.trim().toLowerCase();
+    if (t.length >= 2) tokens.add(t);
+  };
+  push(clientName);
+  push(clientName.replace(/\s+/g, ""));
+  push(host);
+  push(host.replace(/^www\./, ""));
+  const root = host.split(".")[0] || "";
+  push(root);
+  // common variants: apetsaude -> apet
+  if (root.length > 4) push(root.replace(/saude$/, "").replace(/health$/, ""));
+  return [...tokens].filter(Boolean);
+}
+
+export function promptLeaksBrand(texto: string, clientName: string, host: string) {
+  const t = texto.toLowerCase();
+  return brandTokens(clientName, host).some((tok) => {
+    if (tok.length <= 3) {
+      // short tokens need word boundary
+      return new RegExp(`(?:^|[^a-z0-9])${tok.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}(?:[^a-z0-9]|$)`, "i").test(t);
+    }
+    return t.includes(tok);
+  });
+}
+
+/** Remove brand leaks outside grupo marca. Returns sanitized list. */
+export function sanitizeFase1Prompts(
+  prompts: PromptRow[],
+  clientName: string,
+  host: string
+): PromptRow[] {
+  const tokens = brandTokens(clientName, host).sort((a, b) => b.length - a.length);
+  return prompts
+    .map((p) => {
+      if (p.grupo === "marca") return p;
+      let texto = p.texto;
+      for (const tok of tokens) {
+        const escaped = tok.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        texto = texto.replace(new RegExp(escaped, "gi"), "");
+      }
+      texto = texto
+        .replace(/\s{2,}/g, " ")
+        .replace(/\s+([?!,.;:])/g, "$1")
+        .replace(/\bda\s+\?/gi, "?")
+        .replace(/\bdo\s+\?/gi, "?")
+        .replace(/\bde\s+\?/gi, "?")
+        .replace(/\s+da\s+/gi, " ")
+        .replace(/\s+do\s+/gi, " ")
+        .replace(/\(\s*\)/g, "")
+        .trim();
+      // fix leftovers like "plano  pet" / "da ?"
+      texto = texto.replace(/\s{2,}/g, " ").replace(/^[\s,.-]+|[\s,.-]+$/g, "");
+      return { ...p, texto };
+    })
+    .filter((p) => p.texto.length >= 12)
+    .filter((p) => p.grupo === "marca" || !promptLeaksBrand(p.texto, clientName, host));
+}
 
 export async function generateFase1Chunk(opts: {
   modelId: string;
@@ -62,17 +128,25 @@ export async function generateFase1Chunk(opts: {
   const chunk = FASE1_CHUNKS[opts.step];
   if (!chunk) throw new Error(`Chunk fase 1 inválido: ${opts.step}`);
 
+  const allowBrand = opts.step === 1; // only home B has marca
   const system = `Você monta prompts de pesquisa GEO em português do Brasil.
-Regras:
+Regras rígidas:
 - Escreva como um comprador real falaria.
-- Quase todos comerciais. No máximo 1 educacional no grupo marca.
-- Responda SÓ JSON válido, sem markdown.`;
+- Quase todos comerciais.
+- Responda SÓ JSON válido, sem markdown.
+- ${
+    allowBrand
+      ? `O nome da marca "${opts.clientName}" só pode aparecer em prompts com grupo "marca". Em comparação e problema é PROIBIDO.`
+      : `NUNCA escreva o nome da marca "${opts.clientName}", nem o domínio "${opts.host}", nem variações. Pergunte pelo tipo de produto, não pela marca.`
+  }`;
 
-  const user = `Cliente: ${opts.clientName}
-Site: ${opts.siteUrl}
-Host oficial: ${opts.host}
+  const user = `${
+    allowBrand
+      ? `Marca do cliente (só para grupo marca): ${opts.clientName}\nHost: ${opts.host}\n`
+      : `Nicho do mercado (NÃO é para citar como marca nos prompts): descreva produtos genéricos do setor.\n`
+  }Site de referência (só para extrair recursos/preços, NÃO para citar a marca nos textos${allowBrand ? ", exceto grupo marca" : ""}): ${opts.siteUrl}
 
-Trecho da homepage:
+Trecho da homepage (contexto de oferta):
 """
 ${opts.siteBrief.slice(0, 4500)}
 """
@@ -88,6 +162,13 @@ ${
 }
 
 ${chunk.instruction}
+
+Exemplos do JEITO CERTO (sem marca):
+- "Qual plano de saúde pet tem teleconsulta 24h?"
+- "Me indica um plano pet com reembolso em qualquer clínica."
+Exemplos do JEITO ERRADO:
+- "Como funciona a teleconsulta da ${opts.clientName}?"
+- "O que está incluso no plano ${opts.clientName}?"
 
 JSON:
 {"prompts":[{"grupo":"categoria|funcionalidade|preço|comparação|marca|problema|blog","texto":"...","tipo":"comercial|educacional"}]}`;
@@ -109,7 +190,7 @@ JSON:
     throw new Error(`Chunk ${chunk.name} gerou só ${list.length} prompts (mín ${chunk.minCount})`);
   }
 
-  const prompts: PromptRow[] = list.slice(0, chunk.maxCount).map((p: any, i: number) => ({
+  const raw: PromptRow[] = list.slice(0, chunk.maxCount).map((p: any, i: number) => ({
     id: opts.startId + i,
     fase: 1 as const,
     grupo: String(p.grupo || "categoria"),
@@ -117,8 +198,20 @@ JSON:
     tipo: p.tipo === "educacional" ? "educacional" : "comercial",
   }));
 
+  const prompts = sanitizeFase1Prompts(
+    raw.filter((p) => p.texto),
+    opts.clientName,
+    opts.host
+  );
+
+  if (prompts.length < Math.min(chunk.minCount, 12)) {
+    throw new Error(
+      `Chunk ${chunk.name}: após remover vazamento de marca sobraram ${prompts.length} prompts (mín ${chunk.minCount})`
+    );
+  }
+
   return {
-    prompts: prompts.filter((p) => p.texto),
+    prompts,
     cost: res.cost,
     chunkName: chunk.name,
   };
