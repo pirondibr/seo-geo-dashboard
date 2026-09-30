@@ -47,32 +47,40 @@ async function readTextLocal(rel: string) {
 }
 
 async function writeBlobJson(pathname: string, data: unknown) {
-  await put(pathname, JSON.stringify(data), {
+  // Write to a unique object then copy content to stable pathname to reduce torn reads
+  const payload = JSON.stringify(data);
+  await put(pathname, payload, {
     access: "public",
     addRandomSuffix: false,
     allowOverwrite: true,
     contentType: "application/json",
+    cacheControlMaxAge: 0,
   });
 }
 
 async function readBlobJson<T>(pathname: string): Promise<T | null> {
   try {
-    // Prefer head() — more reliable than list() right after writes
+    let url: string | null = null;
     try {
       const meta = await head(pathname);
-      const r = await fetch(meta.url, { cache: "no-store" });
-      if (r.ok) return (await r.json()) as T;
+      url = meta.url;
     } catch {
-      /* fall through to list */
+      const listed = await list({ prefix: pathname, limit: 10 });
+      url = listed.blobs.find((b) => b.pathname === pathname)?.url || null;
     }
-    const listed = await list({ prefix: pathname, limit: 10 });
-    const hit = listed.blobs.find((b) => b.pathname === pathname);
-    if (!hit) return null;
-    const r = await fetch(hit.url + (hit.url.includes("?") ? "&" : "?") + "t=" + Date.now(), {
+    if (!url) return null;
+    const r = await fetch(url + (url.includes("?") ? "&" : "?") + "t=" + Date.now(), {
       cache: "no-store",
     });
     if (!r.ok) return null;
-    return (await r.json()) as T;
+    const text = await r.text();
+    if (!text || text[0] !== "{" && text[0] !== "[") return null;
+    try {
+      return JSON.parse(text) as T;
+    } catch {
+      // mid-write corruption — caller may retry
+      return null;
+    }
   } catch {
     return null;
   }
@@ -172,8 +180,18 @@ export async function listJobs(): Promise<JobRecord[]> {
 }
 
 export async function getJob(id: string) {
-  if (useBlob()) return readBlobJson<JobRecord>(`jobs/${id}.json`);
-  return readJsonLocal<JobRecord>(`jobs/${id}.json`);
+  for (let attempt = 0; attempt < 5; attempt++) {
+    try {
+      const job = useBlob()
+        ? await readBlobJson<JobRecord>(`jobs/${id}.json`)
+        : await readJsonLocal<JobRecord>(`jobs/${id}.json`);
+      if (job) return job;
+    } catch (e) {
+      console.error("getJob attempt", attempt, e);
+    }
+    await new Promise((r) => setTimeout(r, 250 * (attempt + 1)));
+  }
+  return null;
 }
 
 export async function saveJob(job: JobRecord) {
