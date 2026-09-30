@@ -168,18 +168,20 @@ export async function deleteClient(id: string) {
 
 export async function listJobs(): Promise<JobRecord[]> {
   if (useBlob()) {
-    const listed = await list({ prefix: "jobs/", limit: 500 });
-    const out: JobRecord[] = [];
+    const listed = await list({ prefix: "jobs/", limit: 1000 });
+    const ids = new Set<string>();
     for (const b of listed.blobs) {
-      if (!b.pathname.endsWith(".json")) continue;
-      // only top-level jobs/{id}.json mirrors (skip /v/, .locks/, probes)
-      const parts = b.pathname.split("/");
-      if (parts.length !== 2) continue;
-      if (parts[1].includes(".locks")) continue;
-      const job = await readJobLatest(parts[1].replace(/\.json$/, ""));
-      if (job) out.push(job);
+      const top = /^jobs\/([^/]+)\.json$/.exec(b.pathname);
+      if (top) ids.add(top[1]);
+      const nested = /^jobs\/([^/]+)\/v\//.exec(b.pathname);
+      if (nested) ids.add(nested[1]);
     }
-    return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+    const out: JobRecord[] = [];
+    for (const id of ids) {
+      const job = await readJobLatest(id);
+      if (job?.id) out.push(job);
+    }
+    return out.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
   }
   await ensureLocal();
   const dir = path.join(LOCAL_ROOT, "jobs");
@@ -188,9 +190,9 @@ export async function listJobs(): Promise<JobRecord[]> {
   for (const f of files) {
     if (!f.endsWith(".json") || f.includes(".lock")) continue;
     const j = await readJsonLocal<JobRecord>(`jobs/${f}`);
-    if (j) out.push(j);
+    if (j?.id) out.push(j);
   }
-  return out.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  return out.sort((a, b) => (b.createdAt || "").localeCompare(a.createdAt || ""));
 }
 
 /** Read newest versioned snapshot (unique paths avoid Blob CDN stale overwrites). */
@@ -198,7 +200,7 @@ async function readJobLatest(id: string): Promise<JobRecord | null> {
   const listed = await list({ prefix: `jobs/${id}/v/`, limit: 100 });
   const versions = listed.blobs
     .filter((b) => b.pathname.endsWith(".json"))
-    .sort((a, b) => b.pathname.localeCompare(a.pathname));
+    .sort((a, b) => (b.pathname || "").localeCompare(a.pathname || ""));
   for (const ver of versions.slice(0, 5)) {
     try {
       const r = await fetch(ver.url + "?t=" + Date.now(), { cache: "no-store" });
@@ -228,6 +230,7 @@ export async function getJob(id: string) {
 
 export async function saveJob(job: JobRecord) {
   job.updatedAt = new Date().toISOString();
+  if (!job.createdAt) job.createdAt = job.updatedAt;
   if (useBlob()) {
     // Unique pathname = immediately readable (overwrite of same key is CDN-cached stale)
     const vid = `${Date.now()}-${nanoid(8)}`;
@@ -251,12 +254,30 @@ export async function saveJob(job: JobRecord) {
     } catch {
       /* mirror optional */
     }
+    // Public token index — O(1) lookup for client report links (avoid scanning all jobs)
+    if (job.publicToken) {
+      try {
+        await put(
+          `public-tokens/${job.publicToken}.json`,
+          JSON.stringify({ jobId: job.id, status: job.status, clientHtmlPath: job.clientHtmlPath || null }),
+          {
+            access: "public",
+            addRandomSuffix: false,
+            allowOverwrite: true,
+            contentType: "application/json",
+            cacheControlMaxAge: 0,
+          }
+        );
+      } catch {
+        /* index optional */
+      }
+    }
     // Prune old versions (keep last ~25)
     try {
       const listed = await list({ prefix: `jobs/${job.id}/v/`, limit: 100 });
       const versions = listed.blobs
         .filter((b) => b.pathname.endsWith(".json"))
-        .sort((a, b) => b.pathname.localeCompare(a.pathname));
+        .sort((a, b) => (b.pathname || "").localeCompare(a.pathname || ""));
       for (const old of versions.slice(25)) {
         await del(old.url).catch(() => {});
       }
@@ -265,6 +286,13 @@ export async function saveJob(job: JobRecord) {
     }
   } else {
     await writeJsonLocal(`jobs/${job.id}.json`, job);
+    if (job.publicToken) {
+      await writeJsonLocal(`public-tokens/${job.publicToken}.json`, {
+        jobId: job.id,
+        status: job.status,
+        clientHtmlPath: job.clientHtmlPath || null,
+      });
+    }
   }
 }
 
@@ -298,7 +326,7 @@ async function listActiveLocks(jobId: string): Promise<(LockPayload & { pathname
     }
   }
   // Earliest `at` wins (stable across renewals that keep the same `at`)
-  out.sort((a, b) => a.at - b.at || a.pathname.localeCompare(b.pathname));
+  out.sort((a, b) => (a.at || 0) - (b.at || 0) || (a.pathname || "").localeCompare(b.pathname || ""));
   return out;
 }
 
@@ -413,8 +441,34 @@ export async function clearAllJobLocks(jobId: string) {
 }
 
 export async function getJobByPublicToken(token: string) {
+  if (useBlob()) {
+    // Prefer direct index (unique path or overwrite — read via list+latest for safety)
+    try {
+      const listed = await list({ prefix: `public-tokens/${token}.json`, limit: 5 });
+      const hit = listed.blobs.find((b) => b.pathname === `public-tokens/${token}.json`);
+      if (hit) {
+        const idx = (await (await fetch(hit.url + "?t=" + Date.now(), { cache: "no-store" })).json()) as {
+          jobId?: string;
+        };
+        if (idx?.jobId) {
+          const job = await getJob(idx.jobId);
+          if (job?.publicToken === token && job.status === "done" && job.clientHtmlPath) return job;
+        }
+      }
+    } catch {
+      /* fall through */
+    }
+  } else {
+    const idx = await readJsonLocal<{ jobId: string }>(`public-tokens/${token}.json`);
+    if (idx?.jobId) {
+      const job = await getJob(idx.jobId);
+      if (job?.publicToken === token && job.status === "done" && job.clientHtmlPath) return job;
+    }
+  }
+
+  // Fallback: scan jobs (safe sort)
   const jobs = await listJobs();
-  return jobs.find((j) => j.publicToken === token && j.status === "done") || null;
+  return jobs.find((j) => j.publicToken === token && j.status === "done" && j.clientHtmlPath) || null;
 }
 
 export async function saveReportHtml(
