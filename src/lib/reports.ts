@@ -1,6 +1,7 @@
 import { brandRoot, hostOf, hostMatchesOfficial, isSocial, normalizeHost } from "./domain";
 import type { JobRecord, ProbeResult } from "./types";
 import { FX_BRL } from "./types";
+import { normalizeFase1Grupo } from "./prompts";
 
 function esc(s: string) {
   return String(s ?? "")
@@ -38,10 +39,13 @@ export function buildInternalHtml(job: JobRecord, opts?: { through?: 1 | 2 | 3; 
   const rows = (list: ProbeResult[]) =>
     list.length
       ? list
-          .map(
-            (r) =>
-              `<tr><td>${r.site ? "Achou" : r.ok === false ? "Erro" : "Não"}</td><td>${esc(r.grupo || r.padrao || r.recurso || "—")}</td><td>${esc(r.texto)}</td></tr>`
-          )
+          .map((r) => {
+            const tipo =
+              r.fase === 1
+                ? normalizeFase1Grupo(r.grupo || "categoria")
+                : r.grupo || r.padrao || r.recurso || "—";
+            return `<tr><td>${r.site ? "Achou" : r.ok === false ? "Erro" : "Não"}</td><td>${esc(tipo)}</td><td>${esc(r.texto)}</td></tr>`;
+          })
           .join("")
       : `<tr><td colspan="3" class="muted">Sem dados nesta fase ainda.</td></tr>`;
 

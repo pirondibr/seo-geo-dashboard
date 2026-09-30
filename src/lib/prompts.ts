@@ -17,7 +17,54 @@ type GenChunk = {
   maxCount: number;
 };
 
-const FASE1_CHUNKS: GenChunk[] = [
+const FASE1_GRUPOS = [
+  "categoria",
+  "funcionalidade",
+  "preço",
+  "comparação",
+  "marca",
+  "problema",
+  "blog",
+] as const;
+
+type Fase1Grupo = (typeof FASE1_GRUPOS)[number];
+
+/** Gemini sometimes returns "categoria|funcionalidade|preço" — keep a single label. */
+export function normalizeFase1Grupo(raw: string): Fase1Grupo {
+  const aliases: Record<string, Fase1Grupo> = {
+    categoria: "categoria",
+    funcionalidade: "funcionalidade",
+    preco: "preço",
+    preço: "preço",
+    comparacao: "comparação",
+    comparação: "comparação",
+    marca: "marca",
+    problema: "problema",
+    blog: "blog",
+  };
+  const parts = String(raw || "")
+    .toLowerCase()
+    .split(/[|/,+;]+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .map((s) => aliases[s] || aliases[s.normalize("NFD").replace(/\p{M}/gu, "")] || null)
+    .filter(Boolean) as Fase1Grupo[];
+
+  // Prefer the most specific label when the model stacks several
+  const priority: Fase1Grupo[] = [
+    "marca",
+    "blog",
+    "comparação",
+    "problema",
+    "funcionalidade",
+    "preço",
+    "categoria",
+  ];
+  for (const p of priority) {
+    if (parts.includes(p)) return p;
+  }
+  return "categoria";
+}
   {
     name: "home A",
     minCount: 20,
@@ -91,7 +138,8 @@ export function sanitizeFase1Prompts(
   const tokens = brandTokens(clientName, host).sort((a, b) => b.length - a.length);
   return prompts
     .map((p) => {
-      if (p.grupo === "marca") return p;
+      const grupo = normalizeFase1Grupo(p.grupo || "categoria");
+      if (grupo === "marca") return { ...p, grupo };
       let texto = p.texto;
       for (const tok of tokens) {
         const escaped = tok.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -109,7 +157,7 @@ export function sanitizeFase1Prompts(
         .trim();
       // fix leftovers like "plano  pet" / "da ?"
       texto = texto.replace(/\s{2,}/g, " ").replace(/^[\s,.-]+|[\s,.-]+$/g, "");
-      return { ...p, texto };
+      return { ...p, grupo, texto };
     })
     .filter((p) => p.texto.length >= 12)
     .filter((p) => p.grupo === "marca" || !promptLeaksBrand(p.texto, clientName, host));
@@ -171,7 +219,9 @@ Exemplos do JEITO ERRADO:
 - "O que está incluso no plano ${opts.clientName}?"
 
 JSON:
-{"prompts":[{"grupo":"categoria|funcionalidade|preço|comparação|marca|problema|blog","texto":"...","tipo":"comercial|educacional"}]}`;
+{"prompts":[{"grupo":"categoria","texto":"...","tipo":"comercial"}]}
+O campo "grupo" deve ser EXATAMENTE UM destes valores (nunca combine com |): ${FASE1_GRUPOS.join(", ")}.
+O campo "tipo" deve ser "comercial" ou "educacional".`;
 
   const res = await chatCompletion({
     model: opts.modelId,
@@ -193,7 +243,7 @@ JSON:
   const raw: PromptRow[] = list.slice(0, chunk.maxCount).map((p: any, i: number) => ({
     id: opts.startId + i,
     fase: 1 as const,
-    grupo: String(p.grupo || "categoria"),
+    grupo: normalizeFase1Grupo(String(p.grupo || "categoria")),
     texto: String(p.texto || "").trim(),
     tipo: p.tipo === "educacional" ? "educacional" : "comercial",
   }));
