@@ -65,6 +65,8 @@ export function normalizeFase1Grupo(raw: string): Fase1Grupo {
   }
   return "categoria";
 }
+
+const FASE1_CHUNKS: GenChunk[] = [
   {
     name: "home A",
     minCount: 20,
