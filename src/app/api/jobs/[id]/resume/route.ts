@@ -1,9 +1,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isLoggedIn } from "@/lib/auth";
 import { getJob, saveJob } from "@/lib/store";
-import { pushLog, scheduleTick } from "@/lib/job-runner";
+import { pushLog, runTick, scheduleTick } from "@/lib/job-runner";
 
-export const maxDuration = 30;
+export const maxDuration = 60;
 export const dynamic = "force-dynamic";
 
 export async function POST(_: NextRequest, ctx: { params: Promise<{ id: string }> }) {
@@ -14,27 +14,43 @@ export async function POST(_: NextRequest, ctx: { params: Promise<{ id: string }
   if (job.status === "done") {
     return NextResponse.json({ ok: true, message: "Job já concluído" });
   }
+
   if (job.status === "error") {
-    // retry from last non-error phase when possible — if phase is error, go back to generate_fase1 if we have siteBrief
     if (job.siteBrief && (!job.promptsFase1 || job.promptsFase1.length < 40)) {
       job.phase = "generate_fase1";
-      job.fase1GenStep = job.promptsFase1?.length ? Math.min(2, Math.floor((job.promptsFase1.length || 0) / 20)) : 0;
-    } else if (job.promptsFase1 && job.promptsFase1.length >= 40 && (job.resultsFase1?.length || 0) < job.promptsFase1.length) {
+      job.fase1GenStep = job.promptsFase1?.length
+        ? Math.min(2, Math.floor((job.promptsFase1.length || 0) / 20))
+        : 0;
+    } else if (
+      job.promptsFase1 &&
+      job.promptsFase1.length >= 40 &&
+      (job.resultsFase1?.length || 0) < job.promptsFase1.length
+    ) {
       job.phase = "fase1";
       job.cursor = job.resultsFase1?.length || 0;
-    } else {
-      job.phase = job.phase === "error" ? "queued" : job.phase;
+    } else if (job.phase === "error") {
+      job.phase = "queued";
     }
-    job.status = "queued";
     job.error = undefined;
-    job.label = "Retomando…";
   }
+
   job.lockedUntil = undefined;
-  if (job.status === "running") {
-    job.status = "queued"; // allow worker to pick up again
-  }
-  pushLog(job, "Retomar solicitado pela agência · agendando worker…");
+  job.status = "running";
+  pushLog(job, "Retomar: executando worker agora…");
   await saveJob(job);
-  await scheduleTick(id);
-  return NextResponse.json({ ok: true });
+
+  const after = await runTick(id);
+  if (after.status !== "done" && after.status !== "error") {
+    // fire next ticks without blocking the HTTP response too long
+    void scheduleTick(id);
+  }
+
+  return NextResponse.json({
+    ok: true,
+    status: after.status,
+    phase: after.phase,
+    label: after.label,
+    done: after.done,
+    total: after.total,
+  });
 }

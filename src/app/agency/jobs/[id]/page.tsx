@@ -84,7 +84,6 @@ export default function JobPage() {
   const [resuming, setResuming] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const logEndRef = useRef<HTMLDivElement | null>(null);
-  const autoResumeTried = useRef(false);
 
   useEffect(() => {
     let alive = true;
@@ -111,17 +110,16 @@ export default function JobPage() {
     logEndRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [job?.logs?.length]);
 
+  // Keep the pipeline alive: every 20s while not finished, kick one tick via resume
   useEffect(() => {
-    if (!job || autoResumeTried.current) return;
+    if (!job) return;
     if (job.status === "done" || job.status === "error") return;
-    const stale =
-      job.status === "queued" ||
-      ((job.logs?.length || 0) <= 3 &&
-        Date.now() - new Date(job.updatedAt || job.logs?.[0]?.at || Date.now()).getTime() > 8000);
-    if (!stale) return;
-    autoResumeTried.current = true;
+    const t = setInterval(() => {
+      fetch(`/api/jobs/${id}/resume`, { method: "POST" }).catch(() => {});
+    }, 20000);
     fetch(`/api/jobs/${id}/resume`, { method: "POST" }).catch(() => {});
-  }, [job, id]);
+    return () => clearInterval(t);
+  }, [id, job?.status]);
 
   const timing = useMemo(() => {
     if (!job) return null;

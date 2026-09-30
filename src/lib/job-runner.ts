@@ -1,4 +1,5 @@
 import { nanoid } from "nanoid";
+import { waitUntil } from "@vercel/functions";
 import { crawlBlogHints, crawlHomepage } from "./site";
 import {
   extractRecursosFromHits,
@@ -90,16 +91,28 @@ export async function scheduleTick(jobId: string) {
     (process.env.VERCEL_URL ? `https://${process.env.VERCEL_URL}` : null) ||
     (process.env.NODE_ENV !== "production" ? "http://127.0.0.1:3000" : null);
 
+  const runInline = () =>
+    runTick(jobId).catch(async (e) => {
+      console.error("tick error", e);
+      try {
+        const job = await getJob(jobId);
+        if (job && job.status !== "done") {
+          pushLog(job, `Worker falhou: ${e instanceof Error ? e.message : String(e)}`, "error");
+          job.lockedUntil = undefined;
+          await saveJob(job);
+        }
+      } catch {
+        /* ignore */
+      }
+    });
+
   if (!base) {
-    setTimeout(() => {
-      runTick(jobId).catch((e) => console.error("tick error", e));
-    }, 50);
+    setTimeout(runInline, 50);
     return;
   }
 
   const origin = base.replace(/\/$/, "");
-  const url = `${origin}/api/jobs/${jobId}/tick`;
-  void fetch(url, {
+  const pending = fetch(`${origin}/api/jobs/${jobId}/tick`, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${secret}`,
@@ -108,25 +121,21 @@ export async function scheduleTick(jobId: string) {
   })
     .then(async (res) => {
       if (!res.ok) {
-        const job = await getJob(jobId);
-        if (job && job.status !== "done") {
-          pushLog(job, `Falha ao chamar worker (${res.status}). Use Retomar.`, "warn");
-          await saveJob(job);
-        }
+        console.error("scheduleTick HTTP", res.status, await res.text().catch(() => ""));
+        await runInline();
       }
     })
     .catch(async (e) => {
       console.error("scheduleTick failed", e);
-      try {
-        const job = await getJob(jobId);
-        if (job && job.status !== "done") {
-          pushLog(job, `Worker não respondeu: ${e instanceof Error ? e.message : String(e)}. Use Retomar.`, "warn");
-          await saveJob(job);
-        }
-      } catch {
-        /* ignore */
-      }
+      await runInline();
     });
+
+  try {
+    waitUntil(pending);
+  } catch {
+    // outside Vercel runtime
+    void pending;
+  }
 }
 
 export async function runTick(jobId: string) {
