@@ -110,18 +110,20 @@ export default function JobPage() {
     logEndRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [job?.logs?.length]);
 
-  // Keep the pipeline alive: kick resume only when previous finished (no overlap)
+  // Keepalive: at most one resume in flight; skip when API says busy (lease held)
   useEffect(() => {
-    if (!job) return;
-    if (job.status === "done" || job.status === "error") return;
+    if (!id) return;
     let stopped = false;
     let inFlight = false;
+    let terminal = false;
 
     async function kick() {
-      if (stopped || inFlight) return;
+      if (stopped || inFlight || terminal) return;
       inFlight = true;
       try {
-        await fetch(`/api/jobs/${id}/resume`, { method: "POST" });
+        const res = await fetch(`/api/jobs/${id}/resume`, { method: "POST" });
+        const data = await res.json().catch(() => ({}));
+        if (data?.status === "done" || data?.status === "error") terminal = true;
       } catch {
         /* ignore */
       } finally {
@@ -130,12 +132,13 @@ export default function JobPage() {
     }
 
     kick();
-    const t = setInterval(kick, 25000);
+    // 35s > typical batch; lease blocks overlaps anyway
+    const t = setInterval(kick, 35000);
     return () => {
       stopped = true;
       clearInterval(t);
     };
-  }, [id, job?.status]);
+  }, [id]);
 
   const timing = useMemo(() => {
     if (!job) return null;

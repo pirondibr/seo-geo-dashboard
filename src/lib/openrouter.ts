@@ -61,6 +61,8 @@ export async function chatCompletion(opts: {
   webSearch?: boolean;
   temperature?: number;
   timeoutMs?: number;
+  /** Default: 1 for webSearch (avoid double billing), 2 otherwise */
+  retries?: number;
 }): Promise<OrResult> {
   const body: Record<string, unknown> = {
     model: opts.model,
@@ -77,9 +79,10 @@ export async function chatCompletion(opts: {
     ];
   }
 
-  const timeoutMs = opts.timeoutMs ?? (opts.webSearch ? 50000 : 40000);
+  const timeoutMs = opts.timeoutMs ?? (opts.webSearch ? 45000 : 40000);
+  const maxAttempts = Math.max(1, opts.retries ?? (opts.webSearch ? 1 : 2));
   let lastErr: Error | null = null;
-  for (let attempt = 0; attempt < 3; attempt++) {
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {

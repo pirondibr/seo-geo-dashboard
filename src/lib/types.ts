@@ -93,7 +93,18 @@ export type JobRecord = {
   logs?: JobLogEntry[];
   /** 0 = home lote A, 1 = home lote B, 2 = blog — geração fase 1 em pedaços */
   fase1GenStep?: number;
+  /** Lease: only the owner may spend OpenRouter credits for this job */
   lockedUntil?: string;
+  lockOwner?: string;
+  /** Work reserved BEFORE any paid API call (prevents duplicate probes/gens) */
+  claim?: {
+    owner: string;
+    phase: JobPhase | string;
+    /** probe: result index range [from, to); gen: step number in `from` */
+    from: number;
+    to: number;
+    at: string;
+  };
 };
 
 export const MODELS: Record<ModelKind, string> = {

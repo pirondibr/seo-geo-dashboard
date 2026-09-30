@@ -19,18 +19,103 @@ import { FX_BRL, MODELS } from "./types";
 const BATCH = 4;
 const CONCURRENCY = 4;
 const MAX_LOGS = 200;
+/** One probe batch must finish under Vercel 60s — keep lease longer than that */
+const LOCK_MS = 75_000;
+const LOCK_VERIFY_MS = 180;
 
-function slimJobForSave(job: JobRecord): JobRecord {
-  return job;
+export type TickResult = {
+  job: JobRecord;
+  busy?: boolean;
+};
+
+function sleep(ms: number) {
+  return new Promise((r) => setTimeout(r, ms));
 }
 
 function unlock(job: JobRecord) {
   job.lockedUntil = undefined;
+  job.lockOwner = undefined;
+  job.claim = undefined;
 }
 
-async function continueJob(job: JobRecord, jobId: string) {
-  unlock(job);
-  await saveJob(slimJobForSave(job));
+function renewLock(job: JobRecord, owner: string) {
+  job.lockOwner = owner;
+  job.lockedUntil = new Date(Date.now() + LOCK_MS).toISOString();
+}
+
+/** Optimistic lease: write owner, pause, re-read — only proceed if still ours. */
+async function acquireLock(jobId: string): Promise<TickResult | null> {
+  const current = await getJob(jobId);
+  if (!current) throw new Error("Job não encontrado");
+  if (current.status === "done" || current.status === "error") {
+    return { job: current };
+  }
+
+  const locked =
+    current.lockOwner &&
+    current.lockedUntil &&
+    new Date(current.lockedUntil).getTime() > Date.now();
+  if (locked) {
+    return { job: current, busy: true };
+  }
+
+  // Stale lease / orphan claim from a crashed worker — clear and take over
+  const owner = nanoid(12);
+  current.lockOwner = owner;
+  current.lockedUntil = new Date(Date.now() + LOCK_MS).toISOString();
+  current.claim = undefined;
+  current.status = "running";
+  await saveJob(current);
+  await sleep(LOCK_VERIFY_MS);
+
+  const verified = await getJob(jobId);
+  if (!verified) throw new Error("Job não encontrado");
+  if (verified.lockOwner !== owner) {
+    return { job: verified, busy: true };
+  }
+  if (verified.status === "done" || verified.status === "error") {
+    return { job: verified };
+  }
+  return { job: verified };
+}
+
+async function stillOwns(jobId: string, owner: string): Promise<JobRecord | null> {
+  const fresh = await getJob(jobId);
+  if (!fresh) return null;
+  if (fresh.lockOwner !== owner) return null;
+  if (!fresh.lockedUntil || new Date(fresh.lockedUntil).getTime() <= Date.now()) return null;
+  return fresh;
+}
+
+/**
+ * Reserve paid work BEFORE calling OpenRouter.
+ * Returns null if another worker already claimed / advanced.
+ */
+async function claimWork(
+  job: JobRecord,
+  owner: string,
+  phase: string,
+  from: number,
+  to: number
+): Promise<JobRecord | null> {
+  renewLock(job, owner);
+  job.claim = { owner, phase, from, to, at: new Date().toISOString() };
+  await saveJob(job);
+  await sleep(LOCK_VERIFY_MS);
+
+  const fresh = await stillOwns(job.id, owner);
+  if (!fresh) return null;
+  if (!fresh.claim || fresh.claim.owner !== owner || fresh.claim.phase !== phase) return null;
+  if (fresh.claim.from !== from || fresh.claim.to !== to) return null;
+  return fresh;
+}
+
+async function continueJob(job: JobRecord, jobId: string, owner: string) {
+  // Keep lease briefly so overlapping resume/tick sees busy; next tick re-acquires
+  job.lockOwner = owner;
+  job.lockedUntil = new Date(Date.now() + 3_000).toISOString();
+  job.claim = undefined;
+  await saveJob(job);
   await scheduleTick(jobId);
 }
 
@@ -96,9 +181,9 @@ export async function scheduleTick(jobId: string) {
       console.error("tick error", e);
       try {
         const job = await getJob(jobId);
-        if (job && job.status !== "done") {
+        if (job && job.status !== "done" && job.status !== "error") {
           pushLog(job, `Worker falhou: ${e instanceof Error ? e.message : String(e)}`, "error");
-          job.lockedUntil = undefined;
+          unlock(job);
           await saveJob(job);
         }
       } catch {
@@ -120,8 +205,11 @@ export async function scheduleTick(jobId: string) {
     },
   })
     .then(async (res) => {
+      // 409 = another worker holds the lease — do NOT start a second inline worker
+      if (res.status === 409) return;
       if (!res.ok) {
         console.error("scheduleTick HTTP", res.status, await res.text().catch(() => ""));
+        // Only inline-fallback on hard failures, and acquireLock will no-op if busy
         await runInline();
       }
     })
@@ -133,25 +221,20 @@ export async function scheduleTick(jobId: string) {
   try {
     waitUntil(pending);
   } catch {
-    // outside Vercel runtime
     void pending;
   }
 }
 
-export async function runTick(jobId: string) {
-  const job = await getJob(jobId);
-  if (!job) throw new Error("Job não encontrado");
-  if (job.status === "done" || job.status === "error") return job;
+export async function runTick(jobId: string): Promise<TickResult> {
+  const acquired = await acquireLock(jobId);
+  if (!acquired) throw new Error("Job não encontrado");
+  if (acquired.busy) return acquired;
+  if (acquired.job.status === "done" || acquired.job.status === "error") return acquired;
 
-  // prevent overlapping ticks
-  if (job.lockedUntil && new Date(job.lockedUntil).getTime() > Date.now()) {
-    return job;
-  }
-  job.lockedUntil = new Date(Date.now() + 90000).toISOString();
-  await saveJob(slimJobForSave(job));
+  const owner = acquired.job.lockOwner!;
+  let job = acquired.job;
 
   try {
-    job.status = "running";
     if (!job.startedAt) {
       job.startedAt = new Date().toISOString();
       pushLog(job, "Cronômetro iniciado");
@@ -162,15 +245,20 @@ export async function runTick(jobId: string) {
       job.phase = "crawl";
       job.label = "Lendo homepage…";
       pushLog(job, `Abrindo ${job.siteUrl}…`);
-      await saveJob(slimJobForSave(job));
+      renewLock(job, owner);
+      await saveJob(job);
     }
 
     if (job.phase === "crawl") {
       if (!job.siteBrief) {
         job.label = "Lendo homepage…";
         pushLog(job, `Abrindo ${job.siteUrl}…`);
-        await saveJob(slimJobForSave(job));
+        renewLock(job, owner);
+        await saveJob(job);
         const site = await crawlHomepage(job.siteUrl);
+        const owned = await stillOwns(jobId, owner);
+        if (!owned) return { job, busy: true };
+        job = owned;
         if (!job.hosts.length) job.hosts = [site.host];
         else if (!job.hosts.includes(site.host)) job.hosts = [site.host, ...job.hosts];
         job.siteBrief = `${site.title}\n\n${site.text}`;
@@ -186,19 +274,27 @@ export async function runTick(jobId: string) {
       job.phase = "generate_fase1";
       job.label = "Gerando prompts da fase 1…";
       pushLog(job, "Gerando prompts da fase 1 em 3 lotes (evita timeout)…");
-      job.lockedUntil = undefined;
-      await saveJob(slimJobForSave(job));
-      await scheduleTick(jobId);
-      return job;
+      await continueJob(job, jobId, owner);
+      return { job };
     }
 
     if (job.phase === "generate_fase1") {
       const step = job.fase1GenStep || 0;
-      if (step >= 3) {
-        // already complete
-      } else {
+      if (step < 3) {
+        const claimed = await claimWork(job, owner, "generate_fase1", step, step + 1);
+        if (!claimed) return { job, busy: true };
+        job = claimed;
+
+        // Another path may have finished this step while we waited
+        if ((job.fase1GenStep || 0) > step) {
+          await continueJob(job, jobId, owner);
+          return { job };
+        }
+
         pushLog(job, `Gerando lote ${step + 1}/3 da fase 1…`);
-        await saveJob(slimJobForSave(job));
+        renewLock(job, owner);
+        await saveJob(job);
+
         const part = await generateFase1Chunk({
           modelId: job.modelId,
           clientName: job.clientName,
@@ -209,21 +305,29 @@ export async function runTick(jobId: string) {
           step,
           startId: (job.promptsFase1?.length || 0) + 1,
         });
-        job.promptsFase1 = [...(job.promptsFase1 || []), ...part.prompts];
-        job.costUsd += part.cost;
-        job.fase1GenStep = step + 1;
-        pushLog(
-          job,
-          `Lote ${step + 1}/3 (${part.chunkName}): +${part.prompts.length} prompts · total ${job.promptsFase1.length} · US$ ${part.cost.toFixed(4)}`,
-          "ok"
-        );
 
-        if (job.fase1GenStep < 3) {
+        const owned = await stillOwns(jobId, owner);
+        if (!owned || owned.claim?.owner !== owner || owned.claim.from !== step) {
+          pushLog(job, `Lote fase 1 ${step + 1} descartado · lease perdida (evita duplicar prompts)`, "warn");
+          return { job: owned || job, busy: true };
+        }
+        job = owned;
+        // Only append if step still matches (idempotent)
+        if ((job.fase1GenStep || 0) === step) {
+          job.promptsFase1 = [...(job.promptsFase1 || []), ...part.prompts];
+          job.costUsd += part.cost;
+          job.fase1GenStep = step + 1;
+          pushLog(
+            job,
+            `Lote ${step + 1}/3 (${part.chunkName}): +${part.prompts.length} prompts · total ${job.promptsFase1.length} · US$ ${part.cost.toFixed(4)}`,
+            "ok"
+          );
+        }
+
+        if ((job.fase1GenStep || 0) < 3) {
           job.label = `Gerando prompts da fase 1… (${job.fase1GenStep}/3)`;
-          job.lockedUntil = undefined;
-          await saveJob(slimJobForSave(job));
-          await scheduleTick(jobId);
-          return job;
+          await continueJob(job, jobId, owner);
+          return { job };
         }
       }
 
@@ -231,7 +335,6 @@ export async function runTick(jobId: string) {
       if (prompts.length < 40) {
         throw new Error(`Fase 1 ficou com só ${prompts.length} prompts`);
       }
-      // renumber ids
       job.promptsFase1 = prompts.map((p, i) => ({ ...p, id: i + 1 }));
       job.phase = "fase1";
       job.cursor = 0;
@@ -241,28 +344,33 @@ export async function runTick(jobId: string) {
       job.resultsFase1 = [];
       pushLog(job, `Fase 1 pronta: ${job.promptsFase1.length} prompts`, "ok");
       pushLog(job, `Iniciando sondagens OpenRouter (lotes de ${BATCH}, concorrência ${CONCURRENCY})…`);
-      job.lockedUntil = undefined;
-      await saveJob(slimJobForSave(job));
-      await scheduleTick(jobId);
-      return job;
+      await continueJob(job, jobId, owner);
+      return { job };
     }
 
     if (job.phase === "fase1") {
-      await runProbeBatch(job, "fase1");
+      const progressed = await runProbeBatch(job, "fase1", owner);
+      if (!progressed) return { job, busy: true };
+      job = progressed;
       if ((job.cursor || 0) < (job.promptsFase1 || []).length) {
-        await continueJob(job, jobId);
-        return job;
+        await continueJob(job, jobId, owner);
+        return { job };
       }
       const hits = (job.resultsFase1 || []).filter((r) => r.site).length;
       pushLog(job, `Fase 1 concluída: ${hits}/${job.resultsFase1?.length || 0} acharam o site`, "ok");
       job.phase = "generate_fase2";
       job.label = "Montando fase 2…";
       pushLog(job, "Escolhendo seeds e gerando variações da fase 2…");
-      await continueJob(job, jobId);
-      return job;
+      await continueJob(job, jobId, owner);
+      return { job };
     }
 
     if (job.phase === "generate_fase2") {
+      if (job.promptsFase2 && job.promptsFase2.length > 0) {
+        job.phase = "fase2";
+        await continueJob(job, jobId, owner);
+        return { job };
+      }
       const hits = (job.resultsFase1 || []).filter((r) => r.site);
       const seeds = pickFase2Seeds(hits);
       if (!seeds.length) {
@@ -271,44 +379,71 @@ export async function runTick(jobId: string) {
         pushLog(job, "Nenhum seed na fase 1 · pulando fase 2", "warn");
         job.phase = "generate_fase3";
         job.label = "Sem seeds na fase 2 · indo para fase 3…";
-        await continueJob(job, jobId);
-        return job;
+        await continueJob(job, jobId, owner);
+        return { job };
       }
+
+      const claimed = await claimWork(job, owner, "generate_fase2", 0, 1);
+      if (!claimed) return { job, busy: true };
+      job = claimed;
+      if (job.promptsFase2 && job.promptsFase2.length > 0) {
+        job.phase = "fase2";
+        await continueJob(job, jobId, owner);
+        return { job };
+      }
+
       pushLog(job, `Seeds fase 2: ${seeds.map((s) => s.padrao).join(", ")}`);
       const gen = await generateFase2Prompts({ modelId: job.modelId, seeds });
-      job.promptsFase2 = gen.prompts;
-      job.costUsd += gen.cost;
+      const owned = await stillOwns(jobId, owner);
+      if (!owned || owned.claim?.owner !== owner) {
+        pushLog(job, "Geração fase 2 descartada · lease perdida", "warn");
+        return { job: owned || job, busy: true };
+      }
+      job = owned;
+      if (!job.promptsFase2?.length) {
+        job.promptsFase2 = gen.prompts;
+        job.costUsd += gen.cost;
+        pushLog(job, `Fase 2: ${gen.prompts.length} variações geradas`, "ok");
+      }
       job.phase = "fase2";
       job.cursor = 0;
       job.done = 0;
-      job.total = gen.prompts.length;
-      job.label = `Fase 2 · 0/${gen.prompts.length}`;
-      job.resultsFase2 = [];
-      pushLog(job, `Fase 2: ${gen.prompts.length} variações geradas`, "ok");
-      await continueJob(job, jobId);
-      return job;
+      job.total = job.promptsFase2.length;
+      job.label = `Fase 2 · 0/${job.promptsFase2.length}`;
+      job.resultsFase2 = job.resultsFase2 || [];
+      await continueJob(job, jobId, owner);
+      return { job };
     }
 
     if (job.phase === "fase2") {
-      await runProbeBatch(job, "fase2");
+      const progressed = await runProbeBatch(job, "fase2", owner);
+      if (!progressed) return { job, busy: true };
+      job = progressed;
       if ((job.cursor || 0) < (job.promptsFase2 || []).length) {
-        await continueJob(job, jobId);
-        return job;
+        await continueJob(job, jobId, owner);
+        return { job };
       }
       const hits = (job.resultsFase2 || []).filter((r) => r.site).length;
       pushLog(job, `Fase 2 concluída: ${hits}/${job.resultsFase2?.length || 0} acharam`, "ok");
       job.phase = "generate_fase3";
       job.label = "Montando fase 3…";
       pushLog(job, "Gerando situações da fase 3…");
-      await continueJob(job, jobId);
-      return job;
+      await continueJob(job, jobId, owner);
+      return { job };
     }
 
     if (job.phase === "generate_fase3") {
+      if (job.promptsFase3 && job.promptsFase3.length > 0) {
+        job.phase = "fase3";
+        await continueJob(job, jobId, owner);
+        return { job };
+      }
       const hits = (job.resultsFase1 || []).filter((r) => r.site);
       let recursos = extractRecursosFromHits(hits);
       if (!recursos.length) {
-        const from2 = [...new Set((job.resultsFase2 || []).map((r) => r.recurso || r.padrao).filter(Boolean))];
+        const from2 = [
+          ...new Set((job.resultsFase2 || []).map((r) => r.recurso || r.padrao).filter(Boolean)),
+        ];
         recursos = from2.slice(0, 5).map((r) => ({ recurso: String(r), padrao: String(r) }));
       }
       if (!recursos.length) {
@@ -317,11 +452,20 @@ export async function runTick(jobId: string) {
         pushLog(job, "Sem recursos para fase 3 · indo aos relatórios", "warn");
         job.phase = "build_reports";
         job.label = "Gerando relatórios…";
-        await continueJob(job, jobId);
-        return job;
+        await continueJob(job, jobId, owner);
+        return { job };
       }
-      // Cap recursos to keep generation under Vercel timeout
       recursos = recursos.slice(0, 4);
+
+      const claimed = await claimWork(job, owner, "generate_fase3", 0, 1);
+      if (!claimed) return { job, busy: true };
+      job = claimed;
+      if (job.promptsFase3 && job.promptsFase3.length > 0) {
+        job.phase = "fase3";
+        await continueJob(job, jobId, owner);
+        return { job };
+      }
+
       pushLog(job, `Recursos fase 3 (${recursos.length}): ${recursos.map((r) => r.padrao).join(", ")}`);
       const avoid = [
         ...(job.promptsFase1 || []).map((p) => p.texto),
@@ -332,35 +476,49 @@ export async function runTick(jobId: string) {
         recursos,
         avoidTexts: avoid,
       });
-      job.promptsFase3 = gen.prompts;
-      job.costUsd += gen.cost;
+      const owned = await stillOwns(jobId, owner);
+      if (!owned || owned.claim?.owner !== owner) {
+        pushLog(job, "Geração fase 3 descartada · lease perdida", "warn");
+        return { job: owned || job, busy: true };
+      }
+      job = owned;
+      if (!job.promptsFase3?.length) {
+        job.promptsFase3 = gen.prompts;
+        job.costUsd += gen.cost;
+        pushLog(job, `Fase 3: ${gen.prompts.length} situações geradas`, "ok");
+      }
       job.phase = "fase3";
       job.cursor = 0;
       job.done = 0;
-      job.total = gen.prompts.length;
-      job.label = `Fase 3 · 0/${gen.prompts.length}`;
-      job.resultsFase3 = [];
-      pushLog(job, `Fase 3: ${gen.prompts.length} situações geradas`, "ok");
-      await continueJob(job, jobId);
-      return job;
+      job.total = job.promptsFase3.length;
+      job.label = `Fase 3 · 0/${job.promptsFase3.length}`;
+      job.resultsFase3 = job.resultsFase3 || [];
+      await continueJob(job, jobId, owner);
+      return { job };
     }
 
     if (job.phase === "fase3") {
-      await runProbeBatch(job, "fase3");
+      const progressed = await runProbeBatch(job, "fase3", owner);
+      if (!progressed) return { job, busy: true };
+      job = progressed;
       if ((job.cursor || 0) < (job.promptsFase3 || []).length) {
-        await continueJob(job, jobId);
-        return job;
+        await continueJob(job, jobId, owner);
+        return { job };
       }
       const hits = (job.resultsFase3 || []).filter((r) => r.site).length;
       pushLog(job, `Fase 3 concluída: ${hits}/${job.resultsFase3?.length || 0} acharam`, "ok");
       job.phase = "build_reports";
       job.label = "Gerando relatórios…";
       pushLog(job, "Montando HTML interno e relatório do cliente…");
-      await continueJob(job, jobId);
-      return job;
+      await continueJob(job, jobId, owner);
+      return { job };
     }
 
     if (job.phase === "build_reports") {
+      const claimed = await claimWork(job, owner, "build_reports", 0, 1);
+      if (!claimed) return { job, busy: true };
+      job = claimed;
+
       const internal = buildInternalHtml(job);
       const client = buildClientHtml(job);
       const clientFixed = fixFormatAnswer(client);
@@ -380,27 +538,36 @@ export async function runTick(jobId: string) {
         "ok"
       );
       unlock(job);
-      await saveJob(slimJobForSave(job));
-      return job;
+      await saveJob(job);
+      return { job };
     }
 
     pushLog(job, `Fase desconhecida: ${job.phase}`, "warn");
     unlock(job);
-    await saveJob(slimJobForSave(job));
-    return job;
+    await saveJob(job);
+    return { job };
   } catch (e) {
-    job.status = "error";
-    job.phase = "error";
-    job.error = e instanceof Error ? e.message : String(e);
-    job.label = "Erro";
-    unlock(job);
-    pushLog(job, `Erro: ${job.error}`, "error");
-    await saveJob(slimJobForSave(job));
-    return job;
+    const latest = (await getJob(jobId)) || job;
+    // Only the owner may mark error (avoid clobbering a healthy worker)
+    if (latest.lockOwner === owner || !latest.lockOwner) {
+      latest.status = "error";
+      latest.phase = "error";
+      latest.error = e instanceof Error ? e.message : String(e);
+      latest.label = "Erro";
+      unlock(latest);
+      pushLog(latest, `Erro: ${latest.error}`, "error");
+      await saveJob(latest);
+      return { job: latest };
+    }
+    return { job: latest, busy: true };
   }
 }
 
-async function runProbeBatch(job: JobRecord, phase: "fase1" | "fase2" | "fase3") {
+async function runProbeBatch(
+  job: JobRecord,
+  phase: "fase1" | "fase2" | "fase3",
+  owner: string
+): Promise<JobRecord | null> {
   const prompts =
     phase === "fase1"
       ? job.promptsFase1 || []
@@ -410,56 +577,80 @@ async function runProbeBatch(job: JobRecord, phase: "fase1" | "fase2" | "fase3")
   const resultsKey =
     phase === "fase1" ? "resultsFase1" : phase === "fase2" ? "resultsFase2" : "resultsFase3";
 
-  // Source of truth = already saved results length (avoids cursor races)
-  const existing = (job[resultsKey] as ProbeResult[]) || [];
-  const cursor = existing.length;
-  job.cursor = cursor;
-  const slice = prompts.slice(cursor, cursor + BATCH);
+  const existing = ((job[resultsKey] as ProbeResult[]) || []).length;
+  const slice = prompts.slice(existing, existing + BATCH);
   if (!slice.length) {
-    job.done = cursor;
+    job.cursor = existing;
+    job.done = existing;
     job.total = prompts.length;
-    return;
+    return job;
   }
 
-  const from = cursor + 1;
-  const to = cursor + slice.length;
+  const from = existing;
+  const to = existing + slice.length;
+  const claimed = await claimWork(job, owner, phase, from, to);
+  if (!claimed) return null;
+  job = claimed;
+
+  // Re-check length after claim — another worker may have appended
+  const afterClaimLen = ((job[resultsKey] as ProbeResult[]) || []).length;
+  if (afterClaimLen !== from) {
+    job.cursor = afterClaimLen;
+    job.done = afterClaimLen;
+    job.total = prompts.length;
+    return job;
+  }
+
   const labelPhase = phase === "fase1" ? "Fase 1" : phase === "fase2" ? "Fase 2" : "Fase 3";
-  pushLog(job, `${labelPhase} · sondando ${from}–${to} de ${prompts.length}…`);
+  pushLog(job, `${labelPhase} · sondando ${from + 1}–${to} de ${prompts.length}…`);
+  renewLock(job, owner);
+  await saveJob(job);
 
   const batchResults = await mapPool(slice, CONCURRENCY, (p) =>
     probePrompt({ prompt: p, modelId: job.modelId, hosts: job.hosts })
   );
 
-  // Re-read before append to reduce overwrite races
-  const fresh = await getJob(job.id);
-  const freshResults = ((fresh?.[resultsKey] as ProbeResult[]) || existing) as ProbeResult[];
-  if (freshResults.length > cursor) {
-    // Another worker already advanced — adopt its state
-    job[resultsKey] = freshResults as any;
+  const owned = await stillOwns(job.id, owner);
+  if (!owned || owned.claim?.owner !== owner || owned.claim.from !== from) {
+    pushLog(
+      job,
+      `${labelPhase} · lote ${from + 1}–${to} NÃO salvo · outro worker tomou o lease (crédito pode ter sido gasto; não duplicamos resultado)`,
+      "warn"
+    );
+    return owned;
+  }
+  job = owned;
+
+  const freshResults = ((job[resultsKey] as ProbeResult[]) || []) as ProbeResult[];
+  if (freshResults.length !== from) {
+    pushLog(
+      job,
+      `${labelPhase} · lote ${from + 1}–${to} descartado · resultados já em ${freshResults.length}`,
+      "warn"
+    );
     job.cursor = freshResults.length;
     job.done = freshResults.length;
     job.total = prompts.length;
-    job.costUsd = Math.max(job.costUsd, fresh?.costUsd || 0);
-    job.logs = fresh?.logs || job.logs;
-    pushLog(job, `${labelPhase} · outro worker já avançou para ${freshResults.length}/${prompts.length}`, "warn");
-    return;
+    return job;
   }
 
   job[resultsKey] = [...freshResults, ...batchResults] as any;
   job.costUsd += batchResults.reduce((s, r) => s + (r.cost || 0), 0);
-  job.cursor = cursor + slice.length;
-  job.done = job.cursor;
+  job.cursor = to;
+  job.done = to;
   job.total = prompts.length;
   job.label = `${labelPhase} · ${job.done}/${job.total}`;
+  job.claim = undefined;
 
   const hits = batchResults.filter((r) => r.site).length;
   const fails = batchResults.filter((r) => !r.ok).length;
   const batchCost = batchResults.reduce((s, r) => s + (r.cost || 0), 0);
   pushLog(
     job,
-    `${labelPhase} · lote ${from}–${to}: ${hits} achou · ${fails ? fails + " erro · " : ""}US$ ${batchCost.toFixed(4)} · total ${job.done}/${job.total}`,
+    `${labelPhase} · lote ${from + 1}–${to}: ${hits} achou · ${fails ? fails + " erro · " : ""}US$ ${batchCost.toFixed(4)} · total ${job.done}/${job.total}`,
     hits ? "ok" : "info"
   );
+  return job;
 }
 
 function summarize(job: JobRecord) {

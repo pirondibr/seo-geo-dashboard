@@ -15,7 +15,22 @@ export async function POST(req: NextRequest, ctx: { params: Promise<{ id: string
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
   const { id } = await ctx.params;
-  const job = await runTick(id);
+  const result = await runTick(id);
+  const job = result.job;
+  if (result.busy) {
+    return NextResponse.json(
+      {
+        busy: true,
+        id: job.id,
+        status: job.status,
+        phase: job.phase,
+        label: job.label,
+        done: job.done,
+        total: job.total,
+      },
+      { status: 409 }
+    );
+  }
   return NextResponse.json({
     id: job.id,
     status: job.status,
