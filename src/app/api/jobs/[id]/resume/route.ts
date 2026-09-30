@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
 import { isLoggedIn } from "@/lib/auth";
-import { getJob, saveJob } from "@/lib/store";
+import { getJob, saveJob, hasActiveJobLock } from "@/lib/store";
 import { pushLog, scheduleTick } from "@/lib/job-runner";
 
 export const maxDuration = 60;
@@ -28,7 +28,6 @@ function recoverPhase(job: {
   if (!job.siteBrief) return "queued";
   if (genStep < 3 || p1 < 40) return "generate_fase1";
   if (r1 < p1) return "fase1";
-  // undefined = ainda não gerou; [] = pulou de propósito (sem seeds)
   if (job.promptsFase2 === undefined) return "generate_fase2";
   if (p2 > 0 && r2 < p2) return "fase2";
   if (job.promptsFase3 === undefined) return "generate_fase3";
@@ -45,10 +44,7 @@ export async function POST(_: NextRequest, ctx: { params: Promise<{ id: string }
     return NextResponse.json({ ok: true, message: "Job já concluído", status: "done", phase: job.phase });
   }
 
-  // Never clear an active lease — that was causing overlapping OpenRouter spend
-  const locked =
-    job.lockOwner && job.lockedUntil && new Date(job.lockedUntil).getTime() > Date.now();
-  if (locked) {
+  if (await hasActiveJobLock(id)) {
     return NextResponse.json({
       ok: true,
       busy: true,
@@ -60,14 +56,15 @@ export async function POST(_: NextRequest, ctx: { params: Promise<{ id: string }
     });
   }
 
-  if (job.status === "error" || job.phase === "error") {
+  // Resume from error OR cancelled (agency stopped to review, then continues)
+  if (job.status === "error" || job.status === "cancelled" || job.phase === "error") {
     job.phase = recoverPhase(job) as typeof job.phase;
     job.error = undefined;
     job.status = "running";
     job.lockOwner = undefined;
     job.lockedUntil = undefined;
     job.claim = undefined;
-    pushLog(job, `Recuperando do erro → fase ${job.phase}`);
+    pushLog(job, `Retomando → fase ${job.phase}`);
     if (job.phase === "fase1") job.cursor = job.resultsFase1?.length || 0;
     if (job.phase === "fase2") job.cursor = job.resultsFase2?.length || 0;
     if (job.phase === "fase3") job.cursor = job.resultsFase3?.length || 0;
@@ -77,7 +74,6 @@ export async function POST(_: NextRequest, ctx: { params: Promise<{ id: string }
     await saveJob(job);
   }
 
-  // Single entry: schedule one tick. runTick acquires the lease; no inline + schedule double-fire.
   await scheduleTick(id);
 
   job = (await getJob(id)) || job;
@@ -88,6 +84,6 @@ export async function POST(_: NextRequest, ctx: { params: Promise<{ id: string }
     label: job.label,
     done: job.done,
     total: job.total,
-    busy: Boolean(job.lockOwner && job.lockedUntil && new Date(job.lockedUntil).getTime() > Date.now()),
+    busy: await hasActiveJobLock(id),
   });
 }

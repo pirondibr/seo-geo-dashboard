@@ -21,10 +21,12 @@ function money(usd: number) {
   };
 }
 
-export function buildInternalHtml(job: JobRecord) {
+export function buildInternalHtml(job: JobRecord, opts?: { through?: 1 | 2 | 3; draft?: boolean }) {
+  const through = opts?.through ?? 3;
+  const draft = opts?.draft ?? job.status !== "done";
   const f1 = job.resultsFase1 || [];
-  const f2 = job.resultsFase2 || [];
-  const f3 = job.resultsFase3 || [];
+  const f2 = through >= 2 ? job.resultsFase2 || [] : [];
+  const f3 = through >= 3 ? job.resultsFase3 || [] : [];
   const all = [...f1, ...f2, ...f3];
   const hit = (rows: ProbeResult[]) => rows.filter((r) => r.site).length;
   const cost = (rows: ProbeResult[]) => rows.reduce((s, r) => s + (r.cost || 0), 0);
@@ -34,40 +36,52 @@ export function buildInternalHtml(job: JobRecord) {
   const sT = { hit: hit(all), total: all.length, pct: pct(hit(all), all.length), ...money(cost(all)) };
 
   const rows = (list: ProbeResult[]) =>
-    list
-      .map(
-        (r) =>
-          `<tr><td>${r.site ? "Achou" : "Não"}</td><td>${esc(r.grupo || r.padrao || r.recurso || "—")}</td><td>${esc(r.texto)}</td></tr>`
-      )
-      .join("");
+    list.length
+      ? list
+          .map(
+            (r) =>
+              `<tr><td>${r.site ? "Achou" : r.ok === false ? "Erro" : "Não"}</td><td>${esc(r.grupo || r.padrao || r.recurso || "—")}</td><td>${esc(r.texto)}</td></tr>`
+          )
+          .join("")
+      : `<tr><td colspan="3" class="muted">Sem dados nesta fase ainda.</td></tr>`;
+
+  const banner = draft
+    ? `<p class="banner">Parcial · dados até a fase ${through}${job.status === "cancelled" ? " · job parado" : job.status === "running" ? " · job ainda rodando" : ""} · gerado ${esc(new Date().toLocaleString("pt-BR"))}</p>`
+    : "";
+
+  const navF2 = through >= 2 ? `<a href="#p2" onclick="show(2)">Fase 2</a>` : `<span class="nav-disabled">Fase 2</span>`;
+  const navF3 = through >= 3 ? `<a href="#p3" onclick="show(3)">Fase 3</a>` : `<span class="nav-disabled">Fase 3</span>`;
 
   return `<!DOCTYPE html>
 <html lang="pt-BR"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
-<title>${esc(job.clientName)} — Relatório interno · ${esc(job.modelKind)}</title>
+<title>${esc(job.clientName)} — Relatório interno · ${esc(job.modelKind)}${draft ? " (parcial)" : ""}</title>
 <style>
 body{margin:0;font-family:Segoe UI,system-ui,sans-serif;background:#f4f1ea;color:#1a1814;line-height:1.45}
 .wrap{max-width:980px;margin:0 auto;padding:32px 20px 64px}
 h1{font-family:Georgia,serif;font-weight:500;font-size:2rem}
 h2{font-family:Georgia,serif;font-weight:500;margin-top:2rem}
 .muted{color:#6a635a}
+.banner{background:#fff3cd;border:1px solid #e6d89a;border-radius:10px;padding:10px 14px;margin:12px 0 18px;font-size:.92rem}
 .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:10px}
 .card{background:#fff;border:1px solid #e2dbd0;border-radius:14px;padding:14px}
 .big{font-family:Georgia,serif;font-size:1.8rem;margin:0}
 table{width:100%;border-collapse:collapse;background:#fff;border:1px solid #e2dbd0;border-radius:12px;overflow:hidden;margin-top:10px}
 th,td{padding:8px 10px;border-bottom:1px solid #e2dbd0;text-align:left;vertical-align:top;font-size:.92rem}
 th{font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;color:#6a635a}
-.nav{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 20px}
+.nav{display:flex;gap:8px;flex-wrap:wrap;margin:12px 0 20px;align-items:center}
 .nav a{padding:8px 12px;border-radius:999px;background:#fff;border:1px solid #e2dbd0;text-decoration:none;color:#1a1814;font-size:.85rem}
+.nav-disabled{padding:8px 12px;border-radius:999px;background:#eee;border:1px solid #e2dbd0;color:#9a938a;font-size:.85rem}
 .page{display:none}.page.on{display:block}
 </style></head><body>
 <div class="wrap">
 <p class="muted">Relatório interno · ${esc(job.modelKind.toUpperCase())} · ${esc(job.modelId)} · agência</p>
 <h1>${esc(job.clientName)}</h1>
 <p class="muted">${esc(job.siteUrl)} · hosts: ${esc(job.hosts.join(", "))}</p>
+${banner}
 <div class="nav">
 <a href="#p1" onclick="show(1)">Fase 1</a>
-<a href="#p2" onclick="show(2)">Fase 2</a>
-<a href="#p3" onclick="show(3)">Fase 3</a>
+${navF2}
+${navF3}
 <a href="#p4" onclick="show(4)">Total</a>
 </div>
 <section class="page on" id="page1">
@@ -80,28 +94,36 @@ th{font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;color:#6a635a}
 </section>
 <section class="page" id="page2">
 <h2>Fase 2</h2>
-<div class="cards">
+${
+  through >= 2
+    ? `<div class="cards">
 <div class="card"><p class="muted">Achou</p><p class="big">${s2.hit}/${s2.total}</p><p class="muted">${s2.pct}%</p></div>
 <div class="card"><p class="muted">Custo</p><p class="big">${s2.usd}</p><p class="muted">${s2.brl}</p></div>
 </div>
-<table><thead><tr><th>Resultado</th><th>Padrão</th><th>Prompt</th></tr></thead><tbody>${rows(f2)}</tbody></table>
+<table><thead><tr><th>Resultado</th><th>Padrão</th><th>Prompt</th></tr></thead><tbody>${rows(f2)}</tbody></table>`
+    : `<p class="muted">Fase 2 ainda não rodou.</p>`
+}
 </section>
 <section class="page" id="page3">
 <h2>Fase 3</h2>
-<div class="cards">
+${
+  through >= 3
+    ? `<div class="cards">
 <div class="card"><p class="muted">Achou</p><p class="big">${s3.hit}/${s3.total}</p><p class="muted">${s3.pct}%</p></div>
 <div class="card"><p class="muted">Custo</p><p class="big">${s3.usd}</p><p class="muted">${s3.brl}</p></div>
 </div>
-<table><thead><tr><th>Resultado</th><th>Recurso</th><th>Prompt</th></tr></thead><tbody>${rows(f3)}</tbody></table>
+<table><thead><tr><th>Resultado</th><th>Recurso</th><th>Prompt</th></tr></thead><tbody>${rows(f3)}</tbody></table>`
+    : `<p class="muted">Fase 3 ainda não rodou.</p>`
+}
 </section>
 <section class="page" id="page4">
-<h2>Total</h2>
+<h2>Total${draft ? " (parcial)" : ""}</h2>
 <div class="cards">
 <div class="card"><p class="muted">Achou</p><p class="big">${sT.hit}/${sT.total}</p><p class="muted">${sT.pct}%</p></div>
 <div class="card"><p class="muted">Custo</p><p class="big">${sT.usd}</p><p class="muted">${sT.brl}</p></div>
 <div class="card"><p class="muted">F1</p><p class="big">${s1.pct}%</p></div>
-<div class="card"><p class="muted">F2</p><p class="big">${s2.pct}%</p></div>
-<div class="card"><p class="muted">F3</p><p class="big">${s3.pct}%</p></div>
+<div class="card"><p class="muted">F2</p><p class="big">${through >= 2 ? s2.pct + "%" : "—"}</p></div>
+<div class="card"><p class="muted">F3</p><p class="big">${through >= 3 ? s3.pct + "%" : "—"}</p></div>
 </div>
 </section>
 </div>

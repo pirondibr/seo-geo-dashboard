@@ -400,15 +400,40 @@ export async function hasActiveJobLock(jobId: string): Promise<boolean> {
   return active.length > 0;
 }
 
+/** Force-delete all lock blobs for a job (used on cancel). */
+export async function clearAllJobLocks(jobId: string) {
+  if (!useBlob()) {
+    await fs.unlink(path.join(LOCAL_ROOT, "jobs", `${jobId}.lock.json`)).catch(() => {});
+    return;
+  }
+  const listed = await list({ prefix: `jobs/${jobId}.locks/`, limit: 50 });
+  for (const b of listed.blobs) {
+    await del(b.url).catch(() => {});
+  }
+}
+
 export async function getJobByPublicToken(token: string) {
   const jobs = await listJobs();
   return jobs.find((j) => j.publicToken === token && j.status === "done") || null;
 }
 
-export async function saveReportHtml(jobId: string, kind: "client" | "internal", html: string) {
-  const rel = `reports/${jobId}-${kind}.html`;
+export async function saveReportHtml(
+  jobId: string,
+  kind: "client" | "internal",
+  html: string,
+  opts?: { suffix?: string }
+) {
+  // Unique path when suffix set — avoids Blob CDN serving stale overwrites
+  const rel = opts?.suffix
+    ? `reports/${jobId}-${kind}-${opts.suffix}.html`
+    : `reports/${jobId}-${kind}-${Date.now()}.html`;
   if (useBlob()) {
-    const url = await writeBlobText(rel, html, "text/html; charset=utf-8");
+    const url = await put(rel, html, {
+      access: "public",
+      addRandomSuffix: false,
+      contentType: "text/html; charset=utf-8",
+      cacheControlMaxAge: 0,
+    }).then((b) => b.url);
     return { path: rel, url };
   }
   await writeTextLocal(rel, html);

@@ -53,11 +53,46 @@ function stampLease(job: JobRecord, lock: JobLockHandle) {
 }
 
 async function continueJob(job: JobRecord, jobId: string, lock: JobLockHandle) {
+  // Honor cancel that landed while we were working
+  const latest = await getJob(jobId);
+  if (latest?.status === "cancelled") {
+    clearLeaseFields(latest);
+    await saveJob(latest);
+    await releaseJobLock(lock);
+    return;
+  }
   job.claim = undefined;
   stampLease(job, { ...lock, until: Date.now() + 4_000 });
   await saveJob(job);
   await releaseJobLock(lock);
   await scheduleTick(jobId);
+}
+
+/** Snapshot HTML interno assim que uma fase de sondagem termina. */
+async function persistPhaseReport(job: JobRecord, through: 1 | 2 | 3) {
+  const key = through === 1 ? "fase1" : through === 2 ? "fase2" : "fase3";
+  const html = buildInternalHtml(job, { through, draft: true });
+  const saved = await saveReportHtml(job.id, "internal", html, {
+    suffix: `${key}-${Date.now()}`,
+  });
+  job.phaseReports = { ...(job.phaseReports || {}), [key]: saved.path };
+  job.internalHtmlPath = saved.path;
+  pushLog(job, `Relatório interno parcial (fase ${through}) pronto · abrir nos Links`, "ok");
+}
+
+/** Used by cancel route — snapshot with whatever phases finished. */
+export async function buildInternalSnapshotOnCancel(job: JobRecord) {
+  const through: 1 | 2 | 3 =
+    (job.resultsFase3?.length || 0) > 0 ? 3 : (job.resultsFase2?.length || 0) > 0 ? 2 : 1;
+  if (!(job.resultsFase1?.length || 0) && !(job.resultsFase2?.length || 0) && !(job.resultsFase3?.length || 0)) {
+    return;
+  }
+  const html = buildInternalHtml(job, { through, draft: true });
+  const saved = await saveReportHtml(job.id, "internal", html, {
+    suffix: `cancelled-${Date.now()}`,
+  });
+  job.internalHtmlPath = saved.path;
+  pushLog(job, `Snapshot interno salvo ao parar (até fase ${through})`, "ok");
 }
 
 async function claimWork(
@@ -196,7 +231,9 @@ export async function scheduleTick(jobId: string) {
 export async function runTick(jobId: string): Promise<TickResult> {
   const current = await getJob(jobId);
   if (!current) throw new Error("Job não encontrado");
-  if (current.status === "done" || current.status === "error") return { job: current };
+  if (current.status === "done" || current.status === "error" || current.status === "cancelled") {
+    return { job: current };
+  }
 
   if (await hasActiveJobLock(jobId)) {
     return { job: current, busy: true };
@@ -209,7 +246,7 @@ export async function runTick(jobId: string): Promise<TickResult> {
   }
 
   let job = (await getJob(jobId)) || current;
-  if (job.status === "done" || job.status === "error") {
+  if (job.status === "done" || job.status === "error" || job.status === "cancelled") {
     await releaseJobLock(lock);
     return { job };
   }
@@ -345,6 +382,7 @@ export async function runTick(jobId: string): Promise<TickResult> {
       }
       const hits = (job.resultsFase1 || []).filter((r) => r.site).length;
       pushLog(job, `Fase 1 concluída: ${hits}/${job.resultsFase1?.length || 0} acharam o site`, "ok");
+      await persistPhaseReport(job, 1);
       job.phase = "generate_fase2";
       job.label = "Montando fase 2…";
       pushLog(job, "Escolhendo seeds e gerando variações da fase 2…");
@@ -420,6 +458,7 @@ export async function runTick(jobId: string): Promise<TickResult> {
       }
       const hits = (job.resultsFase2 || []).filter((r) => r.site).length;
       pushLog(job, `Fase 2 concluída: ${hits}/${job.resultsFase2?.length || 0} acharam`, "ok");
+      await persistPhaseReport(job, 2);
       job.phase = "generate_fase3";
       job.label = "Montando fase 3…";
       pushLog(job, "Gerando situações da fase 3…");
@@ -510,6 +549,7 @@ export async function runTick(jobId: string): Promise<TickResult> {
       }
       const hits = (job.resultsFase3 || []).filter((r) => r.site).length;
       pushLog(job, `Fase 3 concluída: ${hits}/${job.resultsFase3?.length || 0} acharam`, "ok");
+      await persistPhaseReport(job, 3);
       job.phase = "build_reports";
       job.label = "Gerando relatórios…";
       pushLog(job, "Montando HTML interno e relatório do cliente…");
@@ -526,13 +566,19 @@ export async function runTick(jobId: string): Promise<TickResult> {
       job = claimed.job;
       const held = claimed.lock;
 
-      const internal = buildInternalHtml(job);
+      const internal = buildInternalHtml(job, { through: 3, draft: false });
       const client = buildClientHtml(job);
       const clientFixed = fixFormatAnswer(client);
-      const iSaved = await saveReportHtml(job.id, "internal", internal);
-      const cSaved = await saveReportHtml(job.id, "client", clientFixed);
+      const iSaved = await saveReportHtml(job.id, "internal", internal, { suffix: `final-${Date.now()}` });
+      const cSaved = await saveReportHtml(job.id, "client", clientFixed, { suffix: `final-${Date.now()}` });
       job.internalHtmlPath = iSaved.path;
       job.clientHtmlPath = cSaved.path;
+      job.phaseReports = {
+        ...(job.phaseReports || {}),
+        fase1: job.phaseReports?.fase1,
+        fase2: job.phaseReports?.fase2,
+        fase3: job.phaseReports?.fase3 || iSaved.path,
+      };
       job.summary = summarize(job);
       job.phase = "done";
       job.status = "done";

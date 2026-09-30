@@ -62,7 +62,7 @@ export type JobRecord = {
   hosts: string[];
   modelKind: ModelKind;
   modelId: string;
-  status: "queued" | "running" | "done" | "error";
+  status: "queued" | "running" | "done" | "error" | "cancelled";
   phase: JobPhase;
   label: string;
   done: number;
@@ -90,6 +90,12 @@ export type JobRecord = {
   };
   internalHtmlPath?: string;
   clientHtmlPath?: string;
+  /** Paths to partial internal HTML snapshots (agency), filled as each phase finishes */
+  phaseReports?: {
+    fase1?: string;
+    fase2?: string;
+    fase3?: string;
+  };
   logs?: JobLogEntry[];
   /** 0 = home lote A, 1 = home lote B, 2 = blog — geração fase 1 em pedaços */
   fase1GenStep?: number;

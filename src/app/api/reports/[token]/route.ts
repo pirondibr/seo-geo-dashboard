@@ -13,8 +13,15 @@ export async function GET(req: NextRequest, ctx: { params: Promise<{ token: stri
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
     }
     const job = await getJob(token);
-    if (!job?.internalHtmlPath) return NextResponse.json({ error: "Relatório interno ainda não pronto" }, { status: 404 });
-    const html = await readReportHtml(job.internalHtmlPath);
+    if (!job) return NextResponse.json({ error: "Job não encontrado" }, { status: 404 });
+
+    const phase = req.nextUrl.searchParams.get("phase"); // fase1 | fase2 | fase3 | (latest)
+    let path = job.internalHtmlPath;
+    if (phase === "fase1" || phase === "fase2" || phase === "fase3") {
+      path = job.phaseReports?.[phase] || path;
+    }
+    if (!path) return NextResponse.json({ error: "Relatório interno ainda não pronto" }, { status: 404 });
+    const html = await readReportHtml(path);
     if (!html) return NextResponse.json({ error: "Arquivo não encontrado" }, { status: 404 });
     return new NextResponse(html, {
       headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "private, no-store" },

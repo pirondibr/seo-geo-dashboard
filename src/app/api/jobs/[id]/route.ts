@@ -32,6 +32,7 @@ export async function GET(_: NextRequest, ctx: { params: Promise<{ id: string }>
       startedAt: job.startedAt,
       internalHtmlPath: job.internalHtmlPath,
       clientHtmlPath: job.clientHtmlPath,
+      phaseReports: job.phaseReports || {},
       counts: {
         f1: job.resultsFase1?.length || 0,
         f2: job.resultsFase2?.length || 0,
