@@ -17,7 +17,25 @@ type Job = {
   publicToken: string;
   summary?: { hit: number; total: number; pct: number };
   error?: string;
+  createdAt?: string;
+  updatedAt?: string;
+  startedAt?: string;
 };
+
+function formatDateTime(iso?: string) {
+  if (!iso) return "—";
+  try {
+    return new Date(iso).toLocaleString("pt-BR", {
+      day: "2-digit",
+      month: "2-digit",
+      year: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
+  } catch {
+    return iso;
+  }
+}
 
 export default function AgencyHome() {
   const [clients, setClients] = useState<Client[]>([]);
@@ -90,6 +108,7 @@ export default function AgencyHome() {
         <table className="table">
           <thead>
             <tr>
+              <th>Data</th>
               <th>Cliente</th>
               <th>Modelo</th>
               <th>Status</th>
@@ -101,6 +120,9 @@ export default function AgencyHome() {
           <tbody>
             {jobs.map((j) => (
               <tr key={j.id}>
+                <td style={{ whiteSpace: "nowrap", fontSize: "0.9rem" }}>
+                  {formatDateTime(j.startedAt || j.createdAt)}
+                </td>
                 <td>{j.clientName}</td>
                 <td>{j.modelKind === "gpt" ? "ChatGPT" : "Gemini"}</td>
                 <td>

@@ -21,6 +21,9 @@ export async function GET() {
     summary: j.summary,
     createdAt: j.createdAt,
     updatedAt: j.updatedAt,
+    startedAt: j.startedAt,
+    internalHtmlPath: j.internalHtmlPath || null,
+    clientHtmlPath: j.clientHtmlPath || null,
     error: j.error,
   }));
   return NextResponse.json({ jobs: slim });
