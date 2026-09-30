@@ -111,6 +111,12 @@ export type JobRecord = {
     to: number;
     at: string;
   };
+  /** Cross-link to the sibling model report (GPT ↔ Gemini) for the same client */
+  pairedReport?: {
+    jobId: string;
+    modelKind: ModelKind;
+    publicToken: string;
+  };
 };
 
 export const MODELS: Record<ModelKind, string> = {

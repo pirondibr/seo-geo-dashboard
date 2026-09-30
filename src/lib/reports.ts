@@ -22,9 +22,36 @@ function money(usd: number) {
   };
 }
 
-export function buildInternalHtml(job: JobRecord, opts?: { through?: 1 | 2 | 3; draft?: boolean }) {
+/** Top switcher linking ChatGPT ↔ Gemini reports. */
+export type PairNav = {
+  gpt: { href: string; current?: boolean };
+  gemini: { href: string; current?: boolean };
+};
+
+export function buildPairNavHtml(nav: PairNav | null | undefined) {
+  if (!nav?.gpt?.href || !nav?.gemini?.href) return "";
+  const link = (label: string, href: string, on: boolean) =>
+    on
+      ? `<span class="pair-link on">${label}</span>`
+      : `<a class="pair-link" href="${esc(href)}">${label}</a>`;
+  return `<nav class="pair-nav" aria-label="Trocar modelo">
+  ${link("Relatório ChatGPT", nav.gpt.href, Boolean(nav.gpt.current))}
+  ${link("Relatório Gemini", nav.gemini.href, Boolean(nav.gemini.current))}
+</nav>`;
+}
+
+const PAIR_NAV_CSS = `.pair-nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 18px}
+.pair-link{display:inline-block;padding:8px 14px;border-radius:999px;border:1px solid #e2dbd0;background:#fff;color:#1a1814;text-decoration:none;font-size:.88rem}
+.pair-link.on{background:#1a1814;color:#fff;border-color:#1a1814}
+.pair-link:not(.on):hover{background:#faf7f1}`;
+
+export function buildInternalHtml(
+  job: JobRecord,
+  opts?: { through?: 1 | 2 | 3; draft?: boolean; pairNav?: PairNav | null }
+) {
   const through = opts?.through ?? 3;
   const draft = opts?.draft ?? job.status !== "done";
+  const pairNav = buildPairNavHtml(opts?.pairNav);
   const f1 = job.resultsFase1 || [];
   const f2 = through >= 2 ? job.resultsFase2 || [] : [];
   const f3 = through >= 3 ? job.resultsFase3 || [] : [];
@@ -76,8 +103,10 @@ th{font-size:.72rem;text-transform:uppercase;letter-spacing:.04em;color:#6a635a}
 .nav a{padding:8px 12px;border-radius:999px;background:#fff;border:1px solid #e2dbd0;text-decoration:none;color:#1a1814;font-size:.85rem}
 .nav-disabled{padding:8px 12px;border-radius:999px;background:#eee;border:1px solid #e2dbd0;color:#9a938a;font-size:.85rem}
 .page{display:none}.page.on{display:block}
+${PAIR_NAV_CSS}
 </style></head><body>
 <div class="wrap">
+${pairNav}
 <p class="muted">Relatório interno · ${esc(job.modelKind.toUpperCase())} · ${esc(job.modelId)} · agência</p>
 <h1>${esc(job.clientName)}</h1>
 <p class="muted">${esc(job.siteUrl)} · hosts: ${esc(job.hosts.join(", "))}</p>
@@ -157,7 +186,7 @@ const grupoLabel: Record<string, string> = {
   blog: "Blog",
 };
 
-export function buildClientHtml(job: JobRecord) {
+export function buildClientHtml(job: JobRecord, opts?: { pairNav?: PairNav | null }) {
   const all = [...(job.resultsFase1 || []), ...(job.resultsFase2 || []), ...(job.resultsFase3 || [])];
   const clientRoot = normalizeHost(job.hosts[0]);
   const brandMap = new Map<string, { root: string; name: string; prompts: number }>();
@@ -229,6 +258,7 @@ export function buildClientHtml(job: JobRecord) {
   const modelLabel = job.modelKind === "gpt" ? "ChatGPT" : "Gemini";
   const avatar = job.modelKind === "gpt" ? "AI" : "G";
   const avatarBg = job.modelKind === "gpt" ? "#10a37f" : "#1a73e8";
+  const pairNav = buildPairNavHtml(opts?.pairNav);
 
   return `<!DOCTYPE html>
 <html lang="pt-BR"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width, initial-scale=1"/>
@@ -271,9 +301,11 @@ td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
 .chat-source .dot{width:8px;height:8px;border-radius:99px;background:#9aa0a6}.chat-source.phibo .dot{background:${avatarBg}}
 .chat-source .meta{display:flex;flex-direction:column;min-width:0}.chat-source .host{font-weight:600}.chat-source .title{color:#666;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
 body.drawer-open{overflow:hidden}footer{margin-top:36px;color:var(--muted);font-size:.9rem}
+${PAIR_NAV_CSS}
 @media(max-width:720px){.index{grid-template-columns:1fr}.hide-m{display:none}}
 </style></head><body>
 <div class="wrap">
+${pairNav}
 <p class="kicker">Índice GEO · ${modelLabel} · ${new Date().toLocaleDateString("pt-BR")}</p>
 <h1>${esc(job.clientName)} versus quem mais aparece</h1>
 <p class="lede">Perguntas que um comprador faria. O índice compara ${esc(job.clientName)} com o concorrente que mais foi citado nessas respostas.</p>
