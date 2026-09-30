@@ -147,7 +147,7 @@ export async function runTick(jobId: string) {
   if (job.lockedUntil && new Date(job.lockedUntil).getTime() > Date.now()) {
     return job;
   }
-  job.lockedUntil = new Date(Date.now() + 55000).toISOString();
+  job.lockedUntil = new Date(Date.now() + 90000).toISOString();
   await saveJob(slimJobForSave(job));
 
   try {
@@ -409,25 +409,47 @@ async function runProbeBatch(job: JobRecord, phase: "fase1" | "fase2" | "fase3")
         : job.promptsFase3 || [];
   const resultsKey =
     phase === "fase1" ? "resultsFase1" : phase === "fase2" ? "resultsFase2" : "resultsFase3";
-  const cursor = job.cursor || 0;
+
+  // Source of truth = already saved results length (avoids cursor races)
+  const existing = (job[resultsKey] as ProbeResult[]) || [];
+  const cursor = existing.length;
+  job.cursor = cursor;
   const slice = prompts.slice(cursor, cursor + BATCH);
-  if (!slice.length) return;
+  if (!slice.length) {
+    job.done = cursor;
+    job.total = prompts.length;
+    return;
+  }
 
   const from = cursor + 1;
   const to = cursor + slice.length;
-  pushLog(job, `${phase === "fase1" ? "Fase 1" : phase === "fase2" ? "Fase 2" : "Fase 3"} · sondando ${from}–${to} de ${prompts.length}…`);
+  const labelPhase = phase === "fase1" ? "Fase 1" : phase === "fase2" ? "Fase 2" : "Fase 3";
+  pushLog(job, `${labelPhase} · sondando ${from}–${to} de ${prompts.length}…`);
 
   const batchResults = await mapPool(slice, CONCURRENCY, (p) =>
     probePrompt({ prompt: p, modelId: job.modelId, hosts: job.hosts })
   );
 
-  const existing = (job[resultsKey] as ProbeResult[]) || [];
-  job[resultsKey] = [...existing, ...batchResults] as any;
+  // Re-read before append to reduce overwrite races
+  const fresh = await getJob(job.id);
+  const freshResults = ((fresh?.[resultsKey] as ProbeResult[]) || existing) as ProbeResult[];
+  if (freshResults.length > cursor) {
+    // Another worker already advanced — adopt its state
+    job[resultsKey] = freshResults as any;
+    job.cursor = freshResults.length;
+    job.done = freshResults.length;
+    job.total = prompts.length;
+    job.costUsd = Math.max(job.costUsd, fresh?.costUsd || 0);
+    job.logs = fresh?.logs || job.logs;
+    pushLog(job, `${labelPhase} · outro worker já avançou para ${freshResults.length}/${prompts.length}`, "warn");
+    return;
+  }
+
+  job[resultsKey] = [...freshResults, ...batchResults] as any;
   job.costUsd += batchResults.reduce((s, r) => s + (r.cost || 0), 0);
   job.cursor = cursor + slice.length;
   job.done = job.cursor;
   job.total = prompts.length;
-  const labelPhase = phase === "fase1" ? "Fase 1" : phase === "fase2" ? "Fase 2" : "Fase 3";
   job.label = `${labelPhase} · ${job.done}/${job.total}`;
 
   const hits = batchResults.filter((r) => r.site).length;

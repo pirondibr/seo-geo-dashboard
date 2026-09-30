@@ -110,15 +110,31 @@ export default function JobPage() {
     logEndRef.current?.scrollIntoView({ behavior: "smooth", block: "nearest" });
   }, [job?.logs?.length]);
 
-  // Keep the pipeline alive: every 20s while not finished, kick one tick via resume
+  // Keep the pipeline alive: kick resume only when previous finished (no overlap)
   useEffect(() => {
     if (!job) return;
     if (job.status === "done" || job.status === "error") return;
-    const t = setInterval(() => {
-      fetch(`/api/jobs/${id}/resume`, { method: "POST" }).catch(() => {});
-    }, 20000);
-    fetch(`/api/jobs/${id}/resume`, { method: "POST" }).catch(() => {});
-    return () => clearInterval(t);
+    let stopped = false;
+    let inFlight = false;
+
+    async function kick() {
+      if (stopped || inFlight) return;
+      inFlight = true;
+      try {
+        await fetch(`/api/jobs/${id}/resume`, { method: "POST" });
+      } catch {
+        /* ignore */
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    kick();
+    const t = setInterval(kick, 25000);
+    return () => {
+      stopped = true;
+      clearInterval(t);
+    };
   }, [id, job?.status]);
 
   const timing = useMemo(() => {

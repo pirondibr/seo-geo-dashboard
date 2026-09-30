@@ -1,4 +1,4 @@
-import { put, list, del } from "@vercel/blob";
+import { put, list, del, head } from "@vercel/blob";
 import fs from "fs/promises";
 import path from "path";
 import type { ClientRecord, JobRecord } from "./types";
@@ -57,10 +57,20 @@ async function writeBlobJson(pathname: string, data: unknown) {
 
 async function readBlobJson<T>(pathname: string): Promise<T | null> {
   try {
-    const listed = await list({ prefix: pathname, limit: 5 });
+    // Prefer head() — more reliable than list() right after writes
+    try {
+      const meta = await head(pathname);
+      const r = await fetch(meta.url, { cache: "no-store" });
+      if (r.ok) return (await r.json()) as T;
+    } catch {
+      /* fall through to list */
+    }
+    const listed = await list({ prefix: pathname, limit: 10 });
     const hit = listed.blobs.find((b) => b.pathname === pathname);
     if (!hit) return null;
-    const r = await fetch(hit.url, { cache: "no-store" });
+    const r = await fetch(hit.url + (hit.url.includes("?") ? "&" : "?") + "t=" + Date.now(), {
+      cache: "no-store",
+    });
     if (!r.ok) return null;
     return (await r.json()) as T;
   } catch {
@@ -79,6 +89,13 @@ async function writeBlobText(pathname: string, text: string, contentType: string
 }
 
 async function readBlobText(pathname: string) {
+  try {
+    const meta = await head(pathname);
+    const r = await fetch(meta.url, { cache: "no-store" });
+    if (r.ok) return r.text();
+  } catch {
+    /* list fallback */
+  }
   const listed = await list({ prefix: pathname, limit: 1 });
   const hit = listed.blobs.find((b) => b.pathname === pathname);
   if (!hit) return null;

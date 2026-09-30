@@ -9,10 +9,22 @@ export const dynamic = "force-dynamic";
 export async function POST(_: NextRequest, ctx: { params: Promise<{ id: string }> }) {
   if (!(await isLoggedIn())) return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   const { id } = await ctx.params;
-  const job = await getJob(id);
+  let job = await getJob(id);
   if (!job) return NextResponse.json({ error: "Não encontrado" }, { status: 404 });
   if (job.status === "done") {
-    return NextResponse.json({ ok: true, message: "Job já concluído" });
+    return NextResponse.json({ ok: true, message: "Job já concluído", status: "done", phase: job.phase });
+  }
+
+  if (job.lockedUntil && new Date(job.lockedUntil).getTime() > Date.now()) {
+    return NextResponse.json({
+      ok: true,
+      busy: true,
+      status: job.status,
+      phase: job.phase,
+      label: job.label,
+      done: job.done,
+      total: job.total,
+    });
   }
 
   if (job.status === "error") {
@@ -34,6 +46,11 @@ export async function POST(_: NextRequest, ctx: { params: Promise<{ id: string }
     job.error = undefined;
   }
 
+  // Sync cursor from results before running
+  if (job.phase === "fase1") job.cursor = job.resultsFase1?.length || 0;
+  if (job.phase === "fase2") job.cursor = job.resultsFase2?.length || 0;
+  if (job.phase === "fase3") job.cursor = job.resultsFase3?.length || 0;
+
   job.lockedUntil = undefined;
   job.status = "running";
   pushLog(job, "Retomar: executando worker agora…");
@@ -41,7 +58,6 @@ export async function POST(_: NextRequest, ctx: { params: Promise<{ id: string }
 
   const after = await runTick(id);
   if (after.status !== "done" && after.status !== "error") {
-    // fire next ticks without blocking the HTTP response too long
     void scheduleTick(id);
   }
 
