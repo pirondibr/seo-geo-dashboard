@@ -55,6 +55,13 @@ export async function POST(req: NextRequest) {
   });
 
   for (const job of jobs) {
+    const { getJob, saveJob } = await import("@/lib/store");
+    const { pushLog } = await import("@/lib/job-runner");
+    const fresh = await getJob(job.id);
+    if (fresh) {
+      pushLog(fresh, "Agendando worker…");
+      await saveJob(fresh);
+    }
     await scheduleTick(job.id);
   }
 

@@ -29,6 +29,7 @@ export async function GET(_: NextRequest, ctx: { params: Promise<{ id: string }>
       error: job.error,
       createdAt: job.createdAt,
       updatedAt: job.updatedAt,
+      startedAt: job.startedAt,
       internalHtmlPath: job.internalHtmlPath,
       clientHtmlPath: job.clientHtmlPath,
       counts: {
@@ -39,6 +40,7 @@ export async function GET(_: NextRequest, ctx: { params: Promise<{ id: string }>
         f2Hit: job.resultsFase2?.filter((r) => r.site).length || 0,
         f3Hit: job.resultsFase3?.filter((r) => r.site).length || 0,
       },
+      logs: job.logs || [],
     },
   });
 }

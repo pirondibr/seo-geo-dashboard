@@ -23,6 +23,14 @@ export type JobPhase =
   | "done"
   | "error";
 
+export type JobLogLevel = "info" | "ok" | "warn" | "error";
+
+export type JobLogEntry = {
+  at: string;
+  level: JobLogLevel;
+  message: string;
+};
+
 export type PromptRow = {
   id: number;
   fase: 1 | 2 | 3;
@@ -64,6 +72,7 @@ export type JobRecord = {
   error?: string;
   createdAt: string;
   updatedAt: string;
+  startedAt?: string;
   siteBrief?: string;
   blogTitles?: string[];
   promptsFase1?: PromptRow[];
@@ -81,6 +90,7 @@ export type JobRecord = {
   };
   internalHtmlPath?: string;
   clientHtmlPath?: string;
+  logs?: JobLogEntry[];
 };
 
 export const MODELS: Record<ModelKind, string> = {

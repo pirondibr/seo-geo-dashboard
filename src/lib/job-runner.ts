@@ -12,15 +12,21 @@ import { mapPool } from "./openrouter";
 import { getJob, saveJob, saveReportHtml } from "./store";
 import { buildClientHtml, buildInternalHtml } from "./reports";
 import { brandRoot, hostOf, isSocial, normalizeHost } from "./domain";
-import type { JobRecord, ModelKind, ProbeResult } from "./types";
-import { MODELS } from "./types";
+import type { JobLogLevel, JobRecord, ModelKind, ProbeResult } from "./types";
+import { FX_BRL, MODELS } from "./types";
 
 const BATCH = 8;
 const CONCURRENCY = 4;
+const MAX_LOGS = 200;
 
 function slimJobForSave(job: JobRecord): JobRecord {
-  // Keep results but they can be large — still OK for Blob/local JSON for MVP
   return job;
+}
+
+export function pushLog(job: JobRecord, message: string, level: JobLogLevel = "info") {
+  if (!job.logs) job.logs = [];
+  job.logs.push({ at: new Date().toISOString(), level, message });
+  if (job.logs.length > MAX_LOGS) job.logs = job.logs.slice(-MAX_LOGS);
 }
 
 export async function createJobsForClient(opts: {
@@ -56,7 +62,11 @@ export async function createJobsForClient(opts: {
       resultsFase1: [],
       resultsFase2: [],
       resultsFase3: [],
+      logs: [],
     };
+    pushLog(job, `Job criado · ${kind === "gpt" ? "ChatGPT" : "Gemini"} · ${MODELS[kind]}`);
+    pushLog(job, `Cliente ${opts.clientName} · ${opts.siteUrl}`);
+    pushLog(job, `Hosts oficiais: ${job.hosts.join(", ") || "(nenhum ainda)"}`);
     await saveJob(job);
     jobs.push(job);
   }
@@ -78,14 +88,35 @@ export async function scheduleTick(jobId: string) {
   }
 
   const origin = base.replace(/\/$/, "");
-  // fire-and-forget; do not await the full pipeline
-  void fetch(`${origin}/api/jobs/${jobId}/tick`, {
+  const url = `${origin}/api/jobs/${jobId}/tick`;
+  void fetch(url, {
     method: "POST",
     headers: {
       Authorization: `Bearer ${secret}`,
       "Content-Type": "application/json",
     },
-  }).catch((e) => console.error("scheduleTick failed", e));
+  })
+    .then(async (res) => {
+      if (!res.ok) {
+        const job = await getJob(jobId);
+        if (job && job.status !== "done") {
+          pushLog(job, `Falha ao chamar worker (${res.status}). Use Retomar.`, "warn");
+          await saveJob(job);
+        }
+      }
+    })
+    .catch(async (e) => {
+      console.error("scheduleTick failed", e);
+      try {
+        const job = await getJob(jobId);
+        if (job && job.status !== "done") {
+          pushLog(job, `Worker não respondeu: ${e instanceof Error ? e.message : String(e)}. Use Retomar.`, "warn");
+          await saveJob(job);
+        }
+      } catch {
+        /* ignore */
+      }
+    });
 }
 
 export async function runTick(jobId: string) {
@@ -95,21 +126,38 @@ export async function runTick(jobId: string) {
 
   try {
     job.status = "running";
+    if (!job.startedAt) {
+      job.startedAt = new Date().toISOString();
+      pushLog(job, "Cronômetro iniciado");
+    }
 
     if (job.phase === "queued") {
+      pushLog(job, "Worker iniciado");
       job.phase = "crawl";
       job.label = "Lendo homepage…";
+      pushLog(job, `Abrindo ${job.siteUrl}…`);
       await saveJob(slimJobForSave(job));
     }
 
     if (job.phase === "crawl") {
+      if (!job.label.includes("Lendo")) {
+        job.label = "Lendo homepage…";
+        pushLog(job, `Abrindo ${job.siteUrl}…`);
+        await saveJob(slimJobForSave(job));
+      }
       const site = await crawlHomepage(job.siteUrl);
       if (!job.hosts.length) job.hosts = [site.host];
       else if (!job.hosts.includes(site.host)) job.hosts = [site.host, ...job.hosts];
       job.siteBrief = `${site.title}\n\n${site.text}`;
       job.blogTitles = await crawlBlogHints(job.siteUrl, site.host);
+      pushLog(
+        job,
+        `Homepage ok · ${site.title.slice(0, 80)} · ${job.siteBrief.length} chars · ${job.blogTitles.length} assuntos de blog`,
+        "ok"
+      );
       job.phase = "generate_fase1";
       job.label = "Gerando prompts da fase 1…";
+      pushLog(job, "Gerando 70 prompts da fase 1 via modelo…");
       await saveJob(slimJobForSave(job));
       await scheduleTick(jobId);
       return job;
@@ -132,6 +180,8 @@ export async function runTick(jobId: string) {
       job.total = gen.prompts.length;
       job.label = `Fase 1 · 0/${gen.prompts.length}`;
       job.resultsFase1 = [];
+      pushLog(job, `Fase 1 pronta: ${gen.prompts.length} prompts · custo geração US$ ${gen.cost.toFixed(4)}`, "ok");
+      pushLog(job, `Iniciando sondagens OpenRouter (lotes de ${BATCH}, concorrência ${CONCURRENCY})…`);
       await saveJob(slimJobForSave(job));
       await scheduleTick(jobId);
       return job;
@@ -144,8 +194,11 @@ export async function runTick(jobId: string) {
         await scheduleTick(jobId);
         return job;
       }
+      const hits = (job.resultsFase1 || []).filter((r) => r.site).length;
+      pushLog(job, `Fase 1 concluída: ${hits}/${job.resultsFase1?.length || 0} acharam o site`, "ok");
       job.phase = "generate_fase2";
       job.label = "Montando fase 2…";
+      pushLog(job, "Escolhendo seeds e gerando variações da fase 2…");
       await saveJob(slimJobForSave(job));
       await scheduleTick(jobId);
       return job;
@@ -157,12 +210,14 @@ export async function runTick(jobId: string) {
       if (!seeds.length) {
         job.promptsFase2 = [];
         job.resultsFase2 = [];
+        pushLog(job, "Nenhum seed na fase 1 · pulando fase 2", "warn");
         job.phase = "generate_fase3";
         job.label = "Sem seeds na fase 2 · indo para fase 3…";
         await saveJob(slimJobForSave(job));
         await scheduleTick(jobId);
         return job;
       }
+      pushLog(job, `Seeds fase 2: ${seeds.map((s) => s.padrao).join(", ")}`);
       const gen = await generateFase2Prompts({ modelId: job.modelId, seeds });
       job.promptsFase2 = gen.prompts;
       job.costUsd += gen.cost;
@@ -172,6 +227,7 @@ export async function runTick(jobId: string) {
       job.total = gen.prompts.length;
       job.label = `Fase 2 · 0/${gen.prompts.length}`;
       job.resultsFase2 = [];
+      pushLog(job, `Fase 2: ${gen.prompts.length} variações geradas`, "ok");
       await saveJob(slimJobForSave(job));
       await scheduleTick(jobId);
       return job;
@@ -184,8 +240,11 @@ export async function runTick(jobId: string) {
         await scheduleTick(jobId);
         return job;
       }
+      const hits = (job.resultsFase2 || []).filter((r) => r.site).length;
+      pushLog(job, `Fase 2 concluída: ${hits}/${job.resultsFase2?.length || 0} acharam`, "ok");
       job.phase = "generate_fase3";
       job.label = "Montando fase 3…";
+      pushLog(job, "Gerando situações da fase 3…");
       await saveJob(slimJobForSave(job));
       await scheduleTick(jobId);
       return job;
@@ -195,19 +254,20 @@ export async function runTick(jobId: string) {
       const hits = (job.resultsFase1 || []).filter((r) => r.site);
       let recursos = extractRecursosFromHits(hits);
       if (!recursos.length) {
-        // fallback from fase2 padroes
         const from2 = [...new Set((job.resultsFase2 || []).map((r) => r.recurso || r.padrao).filter(Boolean))];
         recursos = from2.slice(0, 5).map((r) => ({ recurso: String(r), padrao: String(r) }));
       }
       if (!recursos.length) {
         job.promptsFase3 = [];
         job.resultsFase3 = [];
+        pushLog(job, "Sem recursos para fase 3 · indo aos relatórios", "warn");
         job.phase = "build_reports";
         job.label = "Gerando relatórios…";
         await saveJob(slimJobForSave(job));
         await scheduleTick(jobId);
         return job;
       }
+      pushLog(job, `Recursos fase 3 (${recursos.length}): ${recursos.map((r) => r.padrao).join(", ")}`);
       const avoid = [
         ...(job.promptsFase1 || []).map((p) => p.texto),
         ...(job.promptsFase2 || []).map((p) => p.texto),
@@ -225,6 +285,7 @@ export async function runTick(jobId: string) {
       job.total = gen.prompts.length;
       job.label = `Fase 3 · 0/${gen.prompts.length}`;
       job.resultsFase3 = [];
+      pushLog(job, `Fase 3: ${gen.prompts.length} situações geradas`, "ok");
       await saveJob(slimJobForSave(job));
       await scheduleTick(jobId);
       return job;
@@ -237,8 +298,11 @@ export async function runTick(jobId: string) {
         await scheduleTick(jobId);
         return job;
       }
+      const hits = (job.resultsFase3 || []).filter((r) => r.site).length;
+      pushLog(job, `Fase 3 concluída: ${hits}/${job.resultsFase3?.length || 0} acharam`, "ok");
       job.phase = "build_reports";
       job.label = "Gerando relatórios…";
+      pushLog(job, "Montando HTML interno e relatório do cliente…");
       await saveJob(slimJobForSave(job));
       await scheduleTick(jobId);
       return job;
@@ -247,7 +311,6 @@ export async function runTick(jobId: string) {
     if (job.phase === "build_reports") {
       const internal = buildInternalHtml(job);
       const client = buildClientHtml(job);
-      // Fix formatAnswer regexes that may be double-escaped from template
       const clientFixed = fixFormatAnswer(client);
       const iSaved = await saveReportHtml(job.id, "internal", internal);
       const cSaved = await saveReportHtml(job.id, "client", clientFixed);
@@ -259,16 +322,24 @@ export async function runTick(jobId: string) {
       job.label = "Concluído";
       job.done = job.summary.total;
       job.total = job.summary.total;
+      pushLog(
+        job,
+        `Concluído · ${job.summary.hit}/${job.summary.total} (${job.summary.pct}%) · custo US$ ${job.costUsd.toFixed(2)} · R$ ${(job.costUsd * FX_BRL).toFixed(2)}`,
+        "ok"
+      );
       await saveJob(slimJobForSave(job));
       return job;
     }
 
+    pushLog(job, `Fase desconhecida: ${job.phase}`, "warn");
+    await saveJob(slimJobForSave(job));
     return job;
   } catch (e) {
     job.status = "error";
     job.phase = "error";
     job.error = e instanceof Error ? e.message : String(e);
     job.label = "Erro";
+    pushLog(job, `Erro: ${job.error}`, "error");
     await saveJob(slimJobForSave(job));
     return job;
   }
@@ -287,6 +358,10 @@ async function runProbeBatch(job: JobRecord, phase: "fase1" | "fase2" | "fase3")
   const slice = prompts.slice(cursor, cursor + BATCH);
   if (!slice.length) return;
 
+  const from = cursor + 1;
+  const to = cursor + slice.length;
+  pushLog(job, `${phase === "fase1" ? "Fase 1" : phase === "fase2" ? "Fase 2" : "Fase 3"} · sondando ${from}–${to} de ${prompts.length}…`);
+
   const batchResults = await mapPool(slice, CONCURRENCY, (p) =>
     probePrompt({ prompt: p, modelId: job.modelId, hosts: job.hosts })
   );
@@ -299,6 +374,15 @@ async function runProbeBatch(job: JobRecord, phase: "fase1" | "fase2" | "fase3")
   job.total = prompts.length;
   const labelPhase = phase === "fase1" ? "Fase 1" : phase === "fase2" ? "Fase 2" : "Fase 3";
   job.label = `${labelPhase} · ${job.done}/${job.total}`;
+
+  const hits = batchResults.filter((r) => r.site).length;
+  const fails = batchResults.filter((r) => !r.ok).length;
+  const batchCost = batchResults.reduce((s, r) => s + (r.cost || 0), 0);
+  pushLog(
+    job,
+    `${labelPhase} · lote ${from}–${to}: ${hits} achou · ${fails ? fails + " erro · " : ""}US$ ${batchCost.toFixed(4)} · total ${job.done}/${job.total}`,
+    hits ? "ok" : "info"
+  );
 }
 
 function summarize(job: JobRecord) {

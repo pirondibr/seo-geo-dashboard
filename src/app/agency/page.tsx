@@ -13,6 +13,7 @@ type Job = {
   label: string;
   done: number;
   total: number;
+  costUsd: number;
   publicToken: string;
   summary?: { hit: number; total: number; pct: number };
   error?: string;
@@ -93,6 +94,7 @@ export default function AgencyHome() {
               <th>Modelo</th>
               <th>Status</th>
               <th>Progresso</th>
+              <th>Custo</th>
               <th></th>
             </tr>
           </thead>
@@ -125,6 +127,18 @@ export default function AgencyHome() {
                       <span style={{ width: `${Math.round((100 * j.done) / Math.max(j.total, 1))}%` }} />
                     </div>
                   ) : null}
+                </td>
+                <td>
+                  {j.costUsd > 0 ? (
+                    <>
+                      R$ {(j.costUsd * 5.2204001).toFixed(2).replace(".", ",")}
+                      <div className="muted" style={{ fontSize: "0.8rem" }}>
+                        US$ {j.costUsd.toFixed(2).replace(".", ",")}
+                      </div>
+                    </>
+                  ) : (
+                    "—"
+                  )}
                 </td>
                 <td>
                   <Link href={`/agency/jobs/${j.id}`}>Detalhe</Link>
