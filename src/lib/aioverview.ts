@@ -116,14 +116,15 @@ const PAIR_NAV_CSS = `.pair-nav{display:flex;flex-wrap:wrap;gap:8px;margin:0 0 1
 export function buildAiOverviewHtml(rec: AiOverviewRecord, pairNav?: PairNav | null) {
   const nav = buildPairNavHtml(pairNav);
   const date = new Date(rec.createdAt).toLocaleDateString("pt-BR");
+  const perPage = 20;
+  const totalPages = Math.max(1, Math.ceil(rec.keywords.length / perPage));
   const rows = rec.keywords
     .map(
       (k, i) =>
-        `<tr>
+        `<tr data-page="${Math.floor(i / perPage) + 1}">
           <td class="num">${i + 1}</td>
           <td>${esc(k.keyword)}</td>
           <td class="num">${k.volume != null ? k.volume.toLocaleString("pt-BR") : "—"}</td>
-          <td class="num">${k.position != null ? k.position : "—"}</td>
           <td>${k.url ? `<a href="${esc(k.url)}" target="_blank" rel="noopener">${esc(k.url.replace(/^https?:\/\//, "").slice(0, 48))}</a>` : "—"}</td>
         </tr>`
     )
@@ -142,13 +143,17 @@ h1{margin:0 0 10px;font-family:Georgia,serif;font-size:clamp(2rem,4.5vw,3rem);fo
 .card{background:var(--blue-soft);border:1px solid #c5d7f5;border-radius:18px;padding:22px;max-width:320px}
 .label{color:var(--muted);font-size:.86rem;margin:0 0 6px}
 .big{font-family:Georgia,serif;font-size:clamp(2.6rem,5vw,3.8rem);line-height:.95;margin:0;color:var(--blue)}
-.sub{margin:10px 0 0;color:var(--muted)}
 h2{margin:42px 0 8px;font-family:Georgia,serif;font-size:1.55rem;font-weight:500}
 .muted{color:var(--muted)}
 table{width:100%;border-collapse:collapse;margin:10px 0 8px;background:var(--paper);border:1px solid var(--line);border-radius:14px;overflow:hidden}
 th,td{padding:11px 12px;text-align:left;border-bottom:1px solid var(--line);vertical-align:top;font-size:.92rem}
 th{color:var(--muted);font-size:.72rem;letter-spacing:.06em;text-transform:uppercase}
 td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+tbody tr{display:none}tbody tr.is-visible{display:table-row}
+.pager{display:flex;flex-wrap:wrap;align-items:center;gap:10px;margin:14px 0 0}
+.pager button{appearance:none;border:1px solid var(--line);background:#fff;color:var(--ink);border-radius:999px;padding:8px 14px;font:inherit;font-size:.88rem;cursor:pointer}
+.pager button:disabled{opacity:.4;cursor:default}
+.pager .info{color:var(--muted);font-size:.9rem}
 a{color:var(--blue)}footer{margin-top:36px;color:var(--muted);font-size:.9rem}
 ${PAIR_NAV_CSS}
 </style></head><body>
@@ -160,15 +165,43 @@ ${nav}
 <section class="card">
   <p class="label">Palavras com AI Overview</p>
   <p class="big">${rec.keywordCount.toLocaleString("pt-BR")}</p>
-  <p class="sub">extraídas de <strong>${esc(rec.sourceFileName)}</strong></p>
 </section>
-<h2>Lista de palavras</h2>
+<h2>Lista de palavras que aparecem no AI Overview</h2>
 <p class="muted">${rec.keywordCount} termos · ordenados por volume de busca</p>
 <table>
-<thead><tr><th class="num">#</th><th>Palavra-chave</th><th class="num">Volume</th><th class="num">Posição</th><th>URL</th></tr></thead>
-<tbody>${rows}</tbody>
+<thead><tr><th class="num">#</th><th>Palavra-chave</th><th class="num">Volume</th><th>URL</th></tr></thead>
+<tbody id="kw-body">${rows}</tbody>
 </table>
+<nav class="pager" aria-label="Paginação" ${totalPages <= 1 ? 'hidden' : ""}>
+  <button type="button" id="prev-page">Anterior</button>
+  <span class="info" id="page-info">Página 1 de ${totalPages}</span>
+  <button type="button" id="next-page">Próxima</button>
+</nav>
 <footer><p>Fonte: coluna “SERP Features by Keyword” contendo “AI overview”. Relatório gerado em ${esc(new Date(rec.createdAt).toLocaleString("pt-BR"))}.</p></footer>
 </div>
+<script>
+(function () {
+  var perPage = ${perPage};
+  var totalPages = ${totalPages};
+  var page = 1;
+  var rows = Array.prototype.slice.call(document.querySelectorAll("#kw-body tr"));
+  var prev = document.getElementById("prev-page");
+  var next = document.getElementById("next-page");
+  var info = document.getElementById("page-info");
+  function render() {
+    rows.forEach(function (tr) {
+      var p = Number(tr.getAttribute("data-page"));
+      if (p === page) tr.classList.add("is-visible");
+      else tr.classList.remove("is-visible");
+    });
+    if (info) info.textContent = "Página " + page + " de " + totalPages;
+    if (prev) prev.disabled = page <= 1;
+    if (next) next.disabled = page >= totalPages;
+  }
+  if (prev) prev.addEventListener("click", function () { if (page > 1) { page--; render(); } });
+  if (next) next.addEventListener("click", function () { if (page < totalPages) { page++; render(); } });
+  render();
+})();
+</script>
 </body></html>`;
 }
