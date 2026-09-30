@@ -25,8 +25,13 @@ import { brandRoot, hostOf, isSocial, normalizeHost } from "./domain";
 import type { JobLogLevel, JobRecord, ModelKind, ProbeResult } from "./types";
 import { FX_BRL, MODELS } from "./types";
 
-const BATCH = 4;
-const CONCURRENCY = 4;
+const BATCH = 2;
+/** Parallel OpenRouter probes inside one worker (not multiple workers — that double-bills). */
+const CONCURRENCY = 2;
+/** How many probe batches to try in one Vercel invocation before yielding. */
+const MAX_BATCHES_PER_TICK = 6;
+/** Leave headroom under maxDuration=60s for save/claim overhead. */
+const TICK_PROBE_BUDGET_MS = 48_000;
 const MAX_LOGS = 200;
 const LOCK_MS = 75_000;
 const CLAIM_VERIFY_ATTEMPTS = 8;
@@ -369,14 +374,18 @@ export async function runTick(jobId: string): Promise<TickResult> {
     }
 
     if (job.phase === "fase1") {
-      const progressed = await runProbeBatch(job, "fase1", lock);
+      const progressed = await runProbePhase(job, "fase1", lock);
       if (!progressed) {
         await releaseJobLock(lock);
         return { job, busy: true };
       }
       job = progressed.job;
       const held = progressed.lock;
-      if ((job.cursor || 0) < (job.promptsFase1 || []).length) {
+      if (job.status === "cancelled") {
+        await releaseJobLock(held);
+        return { job };
+      }
+      if (!progressed.phaseDone) {
         await continueJob(job, jobId, held);
         return { job };
       }
@@ -445,14 +454,18 @@ export async function runTick(jobId: string): Promise<TickResult> {
     }
 
     if (job.phase === "fase2") {
-      const progressed = await runProbeBatch(job, "fase2", lock);
+      const progressed = await runProbePhase(job, "fase2", lock);
       if (!progressed) {
         await releaseJobLock(lock);
         return { job, busy: true };
       }
       job = progressed.job;
       const held = progressed.lock;
-      if ((job.cursor || 0) < (job.promptsFase2 || []).length) {
+      if (job.status === "cancelled") {
+        await releaseJobLock(held);
+        return { job };
+      }
+      if (!progressed.phaseDone) {
         await continueJob(job, jobId, held);
         return { job };
       }
@@ -536,14 +549,18 @@ export async function runTick(jobId: string): Promise<TickResult> {
     }
 
     if (job.phase === "fase3") {
-      const progressed = await runProbeBatch(job, "fase3", lock);
+      const progressed = await runProbePhase(job, "fase3", lock);
       if (!progressed) {
         await releaseJobLock(lock);
         return { job, busy: true };
       }
       job = progressed.job;
       const held = progressed.lock;
-      if ((job.cursor || 0) < (job.promptsFase3 || []).length) {
+      if (job.status === "cancelled") {
+        await releaseJobLock(held);
+        return { job };
+      }
+      if (!progressed.phaseDone) {
         await continueJob(job, jobId, held);
         return { job };
       }
@@ -613,6 +630,51 @@ export async function runTick(jobId: string): Promise<TickResult> {
     await releaseJobLock(lock);
     return { job: latest };
   }
+}
+
+async function runProbePhase(
+  job: JobRecord,
+  phase: "fase1" | "fase2" | "fase3",
+  lock: JobLockHandle
+): Promise<{ job: JobRecord; lock: JobLockHandle; phaseDone: boolean } | null> {
+  const promptsLen = () =>
+    phase === "fase1"
+      ? (job.promptsFase1 || []).length
+      : phase === "fase2"
+        ? (job.promptsFase2 || []).length
+        : (job.promptsFase3 || []).length;
+
+  const started = Date.now();
+  let batches = 0;
+
+  while (batches < MAX_BATCHES_PER_TICK && Date.now() - started < TICK_PROBE_BUDGET_MS) {
+    const watch = await getJob(job.id);
+    if (watch?.status === "cancelled") {
+      return { job: watch, lock, phaseDone: true };
+    }
+
+    const before = job.cursor || 0;
+    const total = promptsLen();
+    if (before >= total) {
+      return { job, lock, phaseDone: true };
+    }
+
+    const progressed = await runProbeBatch(job, phase, lock);
+    if (!progressed) return null;
+    job = progressed.job;
+    lock = progressed.lock;
+    batches++;
+
+    if ((job.cursor || 0) >= promptsLen()) {
+      return { job, lock, phaseDone: true };
+    }
+    // No progress (empty/skipped) — avoid tight loop
+    if ((job.cursor || 0) <= before) {
+      break;
+    }
+  }
+
+  return { job, lock, phaseDone: (job.cursor || 0) >= promptsLen() };
 }
 
 async function runProbeBatch(
