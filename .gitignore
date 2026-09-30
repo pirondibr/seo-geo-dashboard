@@ -1,0 +1,8 @@
+# Created by Vercel CLI
+.env*.local
+.vercel
+.next
+node_modules
+.data
+*.log
+.DS_Store
