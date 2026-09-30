@@ -60,6 +60,7 @@ export async function chatCompletion(opts: {
   messages: ChatMessage[];
   webSearch?: boolean;
   temperature?: number;
+  timeoutMs?: number;
 }): Promise<OrResult> {
   const body: Record<string, unknown> = {
     model: opts.model,
@@ -76,18 +77,22 @@ export async function chatCompletion(opts: {
     ];
   }
 
+  const timeoutMs = opts.timeoutMs ?? (opts.webSearch ? 50000 : 40000);
   let lastErr: Error | null = null;
   for (let attempt = 0; attempt < 3; attempt++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
     try {
       const res = await fetch(OPENROUTER, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${openRouterKey()}`,
           "Content-Type": "application/json",
-          "HTTP-Referer": process.env.APP_URL || "https://seo-geo-dashboard.vercel.app",
+          "HTTP-Referer": process.env.APP_URL || "https://seo-geo-dashboard-omega.vercel.app",
           "X-Title": "SEO GEO Dashboard",
         },
         body: JSON.stringify(body),
+        signal: controller.signal,
       });
       if (res.status === 429 || res.status >= 500) {
         await new Promise((r) => setTimeout(r, 1000 * (attempt + 1)));
@@ -110,8 +115,16 @@ export async function chatCompletion(opts: {
         raw: data,
       };
     } catch (e) {
-      lastErr = e instanceof Error ? e : new Error(String(e));
+      const msg =
+        e instanceof Error && e.name === "AbortError"
+          ? `OpenRouter timeout (${timeoutMs}ms)`
+          : e instanceof Error
+            ? e.message
+            : String(e);
+      lastErr = new Error(msg);
       await new Promise((r) => setTimeout(r, 800 * (attempt + 1)));
+    } finally {
+      clearTimeout(timer);
     }
   }
   throw lastErr || new Error("OpenRouter falhou");

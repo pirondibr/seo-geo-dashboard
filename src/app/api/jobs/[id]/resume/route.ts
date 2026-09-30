@@ -15,10 +15,23 @@ export async function POST(_: NextRequest, ctx: { params: Promise<{ id: string }
     return NextResponse.json({ ok: true, message: "Job já concluído" });
   }
   if (job.status === "error") {
+    // retry from last non-error phase when possible — if phase is error, go back to generate_fase1 if we have siteBrief
+    if (job.siteBrief && (!job.promptsFase1 || job.promptsFase1.length < 40)) {
+      job.phase = "generate_fase1";
+      job.fase1GenStep = job.promptsFase1?.length ? Math.min(2, Math.floor((job.promptsFase1.length || 0) / 20)) : 0;
+    } else if (job.promptsFase1 && job.promptsFase1.length >= 40 && (job.resultsFase1?.length || 0) < job.promptsFase1.length) {
+      job.phase = "fase1";
+      job.cursor = job.resultsFase1?.length || 0;
+    } else {
+      job.phase = job.phase === "error" ? "queued" : job.phase;
+    }
     job.status = "queued";
-    job.phase = job.phase === "error" ? "queued" : job.phase;
     job.error = undefined;
     job.label = "Retomando…";
+  }
+  job.lockedUntil = undefined;
+  if (job.status === "running") {
+    job.status = "queued"; // allow worker to pick up again
   }
   pushLog(job, "Retomar solicitado pela agência · agendando worker…");
   await saveJob(job);

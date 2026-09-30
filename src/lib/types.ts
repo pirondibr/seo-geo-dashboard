@@ -91,6 +91,9 @@ export type JobRecord = {
   internalHtmlPath?: string;
   clientHtmlPath?: string;
   logs?: JobLogEntry[];
+  /** 0 = home lote A, 1 = home lote B, 2 = blog — geração fase 1 em pedaços */
+  fase1GenStep?: number;
+  lockedUntil?: string;
 };
 
 export const MODELS: Record<ModelKind, string> = {

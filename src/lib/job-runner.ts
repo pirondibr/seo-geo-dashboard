@@ -2,7 +2,7 @@ import { nanoid } from "nanoid";
 import { crawlBlogHints, crawlHomepage } from "./site";
 import {
   extractRecursosFromHits,
-  generateFase1Prompts,
+  generateFase1Chunk,
   generateFase2Prompts,
   generateFase3Prompts,
   pickFase2Seeds,
@@ -15,12 +15,22 @@ import { brandRoot, hostOf, isSocial, normalizeHost } from "./domain";
 import type { JobLogLevel, JobRecord, ModelKind, ProbeResult } from "./types";
 import { FX_BRL, MODELS } from "./types";
 
-const BATCH = 8;
+const BATCH = 4;
 const CONCURRENCY = 4;
 const MAX_LOGS = 200;
 
 function slimJobForSave(job: JobRecord): JobRecord {
   return job;
+}
+
+function unlock(job: JobRecord) {
+  job.lockedUntil = undefined;
+}
+
+async function continueJob(job: JobRecord, jobId: string) {
+  unlock(job);
+  await saveJob(slimJobForSave(job));
+  await scheduleTick(jobId);
 }
 
 export function pushLog(job: JobRecord, message: string, level: JobLogLevel = "info") {
@@ -124,6 +134,13 @@ export async function runTick(jobId: string) {
   if (!job) throw new Error("Job não encontrado");
   if (job.status === "done" || job.status === "error") return job;
 
+  // prevent overlapping ticks
+  if (job.lockedUntil && new Date(job.lockedUntil).getTime() > Date.now()) {
+    return job;
+  }
+  job.lockedUntil = new Date(Date.now() + 55000).toISOString();
+  await saveJob(slimJobForSave(job));
+
   try {
     job.status = "running";
     if (!job.startedAt) {
@@ -140,48 +157,82 @@ export async function runTick(jobId: string) {
     }
 
     if (job.phase === "crawl") {
-      if (!job.label.includes("Lendo")) {
+      if (!job.siteBrief) {
         job.label = "Lendo homepage…";
         pushLog(job, `Abrindo ${job.siteUrl}…`);
         await saveJob(slimJobForSave(job));
+        const site = await crawlHomepage(job.siteUrl);
+        if (!job.hosts.length) job.hosts = [site.host];
+        else if (!job.hosts.includes(site.host)) job.hosts = [site.host, ...job.hosts];
+        job.siteBrief = `${site.title}\n\n${site.text}`;
+        job.blogTitles = await crawlBlogHints(job.siteUrl, site.host);
+        pushLog(
+          job,
+          `Homepage ok · ${site.title.slice(0, 80)} · ${job.siteBrief.length} chars · ${job.blogTitles.length} assuntos de blog`,
+          "ok"
+        );
       }
-      const site = await crawlHomepage(job.siteUrl);
-      if (!job.hosts.length) job.hosts = [site.host];
-      else if (!job.hosts.includes(site.host)) job.hosts = [site.host, ...job.hosts];
-      job.siteBrief = `${site.title}\n\n${site.text}`;
-      job.blogTitles = await crawlBlogHints(job.siteUrl, site.host);
-      pushLog(
-        job,
-        `Homepage ok · ${site.title.slice(0, 80)} · ${job.siteBrief.length} chars · ${job.blogTitles.length} assuntos de blog`,
-        "ok"
-      );
+      job.fase1GenStep = job.fase1GenStep || 0;
+      job.promptsFase1 = job.promptsFase1 || [];
       job.phase = "generate_fase1";
       job.label = "Gerando prompts da fase 1…";
-      pushLog(job, "Gerando 70 prompts da fase 1 via modelo…");
+      pushLog(job, "Gerando prompts da fase 1 em 3 lotes (evita timeout)…");
+      job.lockedUntil = undefined;
       await saveJob(slimJobForSave(job));
       await scheduleTick(jobId);
       return job;
     }
 
     if (job.phase === "generate_fase1") {
-      const gen = await generateFase1Prompts({
-        modelId: job.modelId,
-        clientName: job.clientName,
-        siteUrl: job.siteUrl,
-        host: job.hosts[0],
-        siteBrief: job.siteBrief || "",
-        blogTitles: job.blogTitles || [],
-      });
-      job.promptsFase1 = gen.prompts;
-      job.costUsd += gen.cost;
+      const step = job.fase1GenStep || 0;
+      if (step >= 3) {
+        // already complete
+      } else {
+        pushLog(job, `Gerando lote ${step + 1}/3 da fase 1…`);
+        await saveJob(slimJobForSave(job));
+        const part = await generateFase1Chunk({
+          modelId: job.modelId,
+          clientName: job.clientName,
+          siteUrl: job.siteUrl,
+          host: job.hosts[0],
+          siteBrief: job.siteBrief || "",
+          blogTitles: job.blogTitles || [],
+          step,
+          startId: (job.promptsFase1?.length || 0) + 1,
+        });
+        job.promptsFase1 = [...(job.promptsFase1 || []), ...part.prompts];
+        job.costUsd += part.cost;
+        job.fase1GenStep = step + 1;
+        pushLog(
+          job,
+          `Lote ${step + 1}/3 (${part.chunkName}): +${part.prompts.length} prompts · total ${job.promptsFase1.length} · US$ ${part.cost.toFixed(4)}`,
+          "ok"
+        );
+
+        if (job.fase1GenStep < 3) {
+          job.label = `Gerando prompts da fase 1… (${job.fase1GenStep}/3)`;
+          job.lockedUntil = undefined;
+          await saveJob(slimJobForSave(job));
+          await scheduleTick(jobId);
+          return job;
+        }
+      }
+
+      const prompts = job.promptsFase1 || [];
+      if (prompts.length < 40) {
+        throw new Error(`Fase 1 ficou com só ${prompts.length} prompts`);
+      }
+      // renumber ids
+      job.promptsFase1 = prompts.map((p, i) => ({ ...p, id: i + 1 }));
       job.phase = "fase1";
       job.cursor = 0;
       job.done = 0;
-      job.total = gen.prompts.length;
-      job.label = `Fase 1 · 0/${gen.prompts.length}`;
+      job.total = job.promptsFase1.length;
+      job.label = `Fase 1 · 0/${job.promptsFase1.length}`;
       job.resultsFase1 = [];
-      pushLog(job, `Fase 1 pronta: ${gen.prompts.length} prompts · custo geração US$ ${gen.cost.toFixed(4)}`, "ok");
+      pushLog(job, `Fase 1 pronta: ${job.promptsFase1.length} prompts`, "ok");
       pushLog(job, `Iniciando sondagens OpenRouter (lotes de ${BATCH}, concorrência ${CONCURRENCY})…`);
+      job.lockedUntil = undefined;
       await saveJob(slimJobForSave(job));
       await scheduleTick(jobId);
       return job;
@@ -189,9 +240,8 @@ export async function runTick(jobId: string) {
 
     if (job.phase === "fase1") {
       await runProbeBatch(job, "fase1");
-      await saveJob(slimJobForSave(job));
       if ((job.cursor || 0) < (job.promptsFase1 || []).length) {
-        await scheduleTick(jobId);
+        await continueJob(job, jobId);
         return job;
       }
       const hits = (job.resultsFase1 || []).filter((r) => r.site).length;
@@ -199,8 +249,7 @@ export async function runTick(jobId: string) {
       job.phase = "generate_fase2";
       job.label = "Montando fase 2…";
       pushLog(job, "Escolhendo seeds e gerando variações da fase 2…");
-      await saveJob(slimJobForSave(job));
-      await scheduleTick(jobId);
+      await continueJob(job, jobId);
       return job;
     }
 
@@ -213,8 +262,7 @@ export async function runTick(jobId: string) {
         pushLog(job, "Nenhum seed na fase 1 · pulando fase 2", "warn");
         job.phase = "generate_fase3";
         job.label = "Sem seeds na fase 2 · indo para fase 3…";
-        await saveJob(slimJobForSave(job));
-        await scheduleTick(jobId);
+        await continueJob(job, jobId);
         return job;
       }
       pushLog(job, `Seeds fase 2: ${seeds.map((s) => s.padrao).join(", ")}`);
@@ -228,16 +276,14 @@ export async function runTick(jobId: string) {
       job.label = `Fase 2 · 0/${gen.prompts.length}`;
       job.resultsFase2 = [];
       pushLog(job, `Fase 2: ${gen.prompts.length} variações geradas`, "ok");
-      await saveJob(slimJobForSave(job));
-      await scheduleTick(jobId);
+      await continueJob(job, jobId);
       return job;
     }
 
     if (job.phase === "fase2") {
       await runProbeBatch(job, "fase2");
-      await saveJob(slimJobForSave(job));
       if ((job.cursor || 0) < (job.promptsFase2 || []).length) {
-        await scheduleTick(jobId);
+        await continueJob(job, jobId);
         return job;
       }
       const hits = (job.resultsFase2 || []).filter((r) => r.site).length;
@@ -245,8 +291,7 @@ export async function runTick(jobId: string) {
       job.phase = "generate_fase3";
       job.label = "Montando fase 3…";
       pushLog(job, "Gerando situações da fase 3…");
-      await saveJob(slimJobForSave(job));
-      await scheduleTick(jobId);
+      await continueJob(job, jobId);
       return job;
     }
 
@@ -263,10 +308,11 @@ export async function runTick(jobId: string) {
         pushLog(job, "Sem recursos para fase 3 · indo aos relatórios", "warn");
         job.phase = "build_reports";
         job.label = "Gerando relatórios…";
-        await saveJob(slimJobForSave(job));
-        await scheduleTick(jobId);
+        await continueJob(job, jobId);
         return job;
       }
+      // Cap recursos to keep generation under Vercel timeout
+      recursos = recursos.slice(0, 4);
       pushLog(job, `Recursos fase 3 (${recursos.length}): ${recursos.map((r) => r.padrao).join(", ")}`);
       const avoid = [
         ...(job.promptsFase1 || []).map((p) => p.texto),
@@ -286,16 +332,14 @@ export async function runTick(jobId: string) {
       job.label = `Fase 3 · 0/${gen.prompts.length}`;
       job.resultsFase3 = [];
       pushLog(job, `Fase 3: ${gen.prompts.length} situações geradas`, "ok");
-      await saveJob(slimJobForSave(job));
-      await scheduleTick(jobId);
+      await continueJob(job, jobId);
       return job;
     }
 
     if (job.phase === "fase3") {
       await runProbeBatch(job, "fase3");
-      await saveJob(slimJobForSave(job));
       if ((job.cursor || 0) < (job.promptsFase3 || []).length) {
-        await scheduleTick(jobId);
+        await continueJob(job, jobId);
         return job;
       }
       const hits = (job.resultsFase3 || []).filter((r) => r.site).length;
@@ -303,8 +347,7 @@ export async function runTick(jobId: string) {
       job.phase = "build_reports";
       job.label = "Gerando relatórios…";
       pushLog(job, "Montando HTML interno e relatório do cliente…");
-      await saveJob(slimJobForSave(job));
-      await scheduleTick(jobId);
+      await continueJob(job, jobId);
       return job;
     }
 
@@ -327,11 +370,13 @@ export async function runTick(jobId: string) {
         `Concluído · ${job.summary.hit}/${job.summary.total} (${job.summary.pct}%) · custo US$ ${job.costUsd.toFixed(2)} · R$ ${(job.costUsd * FX_BRL).toFixed(2)}`,
         "ok"
       );
+      unlock(job);
       await saveJob(slimJobForSave(job));
       return job;
     }
 
     pushLog(job, `Fase desconhecida: ${job.phase}`, "warn");
+    unlock(job);
     await saveJob(slimJobForSave(job));
     return job;
   } catch (e) {
@@ -339,6 +384,7 @@ export async function runTick(jobId: string) {
     job.phase = "error";
     job.error = e instanceof Error ? e.message : String(e);
     job.label = "Erro";
+    unlock(job);
     pushLog(job, `Erro: ${job.error}`, "error");
     await saveJob(slimJobForSave(job));
     return job;
