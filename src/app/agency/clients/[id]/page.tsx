@@ -186,83 +186,82 @@ export default function ClientDetailPage() {
             Ainda sem jobs GEO para este cliente.
           </p>
         ) : (
-          <>
-            <p className="muted" style={{ margin: "0 0 12px", fontSize: "0.92rem" }}>
-              {formatDateTime(latestRunAt)}
-            </p>
-            <div style={{ display: "grid", gap: 12 }}>
-              {latestJobs.map((j) => {
-                const model = j.modelKind === "gpt" ? "ChatGPT" : "Gemini";
-                const hasInternal = Boolean(j.internalHtmlPath || j.phaseReports?.fase1);
-                const hasClient = j.status === "done" && Boolean(j.clientHtmlPath || j.publicToken);
-                return (
-                  <div
-                    key={j.id}
-                    style={{
-                      background: "#faf8f4",
-                      border: "1px solid #e2dbd0",
-                      borderRadius: 12,
-                      padding: "12px 14px",
-                    }}
-                  >
-                    <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "baseline" }}>
-                      <strong>{model}</strong>
-                      <span
-                        className={`badge ${
-                          j.status === "done"
-                            ? "ok"
-                            : j.status === "error" || j.status === "cancelled"
-                              ? "err"
-                              : j.status === "running"
-                                ? "run"
-                                : "queue"
-                        }`}
-                      >
-                        {j.status === "cancelled" ? "parado" : j.status}
+          <div style={{ display: "grid", gap: 12 }}>
+            {latestJobs.map((j) => {
+              const model = j.modelKind === "gpt" ? "ChatGPT" : "Gemini";
+              const hasInternal = Boolean(j.internalHtmlPath || j.phaseReports?.fase1);
+              const hasClient = j.status === "done" && Boolean(j.clientHtmlPath || j.publicToken);
+              const runAt = j.startedAt || j.createdAt || latestRunAt;
+              return (
+                <div
+                  key={j.id}
+                  style={{
+                    background: "#faf8f4",
+                    border: "1px solid #e2dbd0",
+                    borderRadius: 12,
+                    padding: "12px 14px",
+                  }}
+                >
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 8, alignItems: "baseline" }}>
+                    <strong>{model}</strong>
+                    <span
+                      className={`badge ${
+                        j.status === "done"
+                          ? "ok"
+                          : j.status === "error" || j.status === "cancelled"
+                            ? "err"
+                            : j.status === "running"
+                              ? "run"
+                              : "queue"
+                      }`}
+                    >
+                      {j.status === "cancelled" ? "parado" : j.status}
+                    </span>
+                    <span className="muted" style={{ fontSize: "0.88rem" }}>
+                      {formatDateTime(runAt)}
+                    </span>
+                    {j.summary ? (
+                      <span className="muted" style={{ fontSize: "0.88rem" }}>
+                        {j.summary.pct}% ({j.summary.hit}/{j.summary.total})
                       </span>
-                      {j.summary ? (
-                        <span className="muted" style={{ fontSize: "0.88rem" }}>
-                          {j.summary.pct}% ({j.summary.hit}/{j.summary.total})
-                        </span>
-                      ) : (
-                        <span className="muted" style={{ fontSize: "0.88rem" }}>
-                          {j.label}
-                        </span>
-                      )}
-                    </div>
-                    <div className="row-actions" style={{ marginTop: 10, flexWrap: "wrap" }}>
-                      {hasInternal ? (
-                        <a
-                          className="btn secondary"
-                          href={`/api/reports/${j.id}?kind=internal`}
-                          target="_blank"
-                          rel="noreferrer"
-                        >
-                          Relatório interno
-                        </a>
-                      ) : (
-                        <span className="muted" style={{ fontSize: "0.88rem" }}>
-                          Interno ainda não pronto
-                        </span>
-                      )}
-                      {hasClient ? (
-                        <a className="btn secondary" href={`/r/${j.publicToken}`} target="_blank" rel="noreferrer">
-                          Relatório cliente
-                        </a>
-                      ) : (
-                        <span className="muted" style={{ fontSize: "0.88rem" }}>
-                          Cliente: quando concluir
-                        </span>
-                      )}
-                      <Link className="btn secondary" href={`/agency/jobs/${j.id}`}>
-                        Ver job
-                      </Link>
-                    </div>
+                    ) : (
+                      <span className="muted" style={{ fontSize: "0.88rem" }}>
+                        {j.label}
+                      </span>
+                    )}
                   </div>
-                );
-              })}
-            </div>
-          </>
+                  <div className="row-actions" style={{ marginTop: 10, flexWrap: "wrap" }}>
+                    {hasInternal ? (
+                      <a
+                        className="btn secondary"
+                        href={`/api/reports/${j.id}?kind=internal`}
+                        target="_blank"
+                        rel="noreferrer"
+                      >
+                        Relatório interno
+                      </a>
+                    ) : (
+                      <span className="muted" style={{ fontSize: "0.88rem" }}>
+                        Interno ainda não pronto
+                      </span>
+                    )}
+                    {hasClient ? (
+                      <a className="btn secondary" href={`/r/${j.publicToken}`} target="_blank" rel="noreferrer">
+                        Relatório cliente
+                      </a>
+                    ) : (
+                      <span className="muted" style={{ fontSize: "0.88rem" }}>
+                        Cliente: quando concluir
+                      </span>
+                    )}
+                    <Link className="btn secondary" href={`/agency/jobs/${j.id}`}>
+                      Ver job
+                    </Link>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
         )}
       </form>
 

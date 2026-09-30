@@ -32,21 +32,21 @@ export async function GET(_: NextRequest, ctx: { params: Promise<{ id: string }>
   const all = (await listJobs()).filter((j) => j.clientId === id);
   all.sort((a, b) => String(b.createdAt || "").localeCompare(String(a.createdAt || "")));
 
-  // Latest "run": newest job + siblings for same client created within 2 minutes (ex.: GPT+Gemini)
-  let latestJobs: ReturnType<typeof slimJob>[] = [];
-  let latestRunAt: string | null = null;
-  if (all.length) {
-    const newest = all[0];
-    latestRunAt = newest.startedAt || newest.createdAt;
-    const t0 = new Date(newest.createdAt).getTime();
-    const siblings = all.filter((j) => Math.abs(new Date(j.createdAt).getTime() - t0) <= 2 * 60 * 1000);
-    // Prefer one per model in that run
-    const byKind = new Map<string, (typeof all)[0]>();
-    for (const j of siblings) {
-      if (!byKind.has(j.modelKind)) byKind.set(j.modelKind, j);
-    }
-    latestJobs = [...byKind.values()].map(slimJob);
+  // Latest job per model (ChatGPT and Gemini independently)
+  const byKind = new Map<string, (typeof all)[0]>();
+  for (const j of all) {
+    if (j.modelKind !== "gpt" && j.modelKind !== "gemini") continue;
+    if (!byKind.has(j.modelKind)) byKind.set(j.modelKind, j);
   }
+  const latestJobs = ["gpt", "gemini"]
+    .map((k) => byKind.get(k))
+    .filter(Boolean)
+    .map((j) => slimJob(j!));
+  const latestRunAt = latestJobs.length
+    ? latestJobs
+        .map((j) => j.startedAt || j.createdAt)
+        .sort((a, b) => String(b).localeCompare(String(a)))[0]
+    : null;
 
   const latestAi = await getLatestAiOverviewForClient(id);
 
